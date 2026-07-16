@@ -182,7 +182,7 @@ static void dequantize_row_q2_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
     GGML_ASSERT(k % QK2_0 == 0);
     constexpr int block_size = 256;
-    const int64_t n_blocks = (k + block_size - 1) / block_size;
+    const int64_t n_blocks = ((k / 4) + block_size - 1) / block_size;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_blocks) *
         sycl::range<3>(1, 1, block_size),
         sycl::range<3>(1, 1, block_size)),
