@@ -854,23 +854,35 @@ tiles, and minimal barriers. Standard for a production quantized XMX GEMM, but r
 this structure is wrong. A properly-amortized kernel is required before comparing to oneDNN's ~916.
 This is the multi-session engineering flagged from the start.
 
-### Ceiling re-assessment - IMPORTANT before investing more in item 1
+### Ceiling - MEASURED (corrected; an earlier draft said ~1.3x, that was too pessimistic)
 
-Earlier framing ("delete 54 GB, ~9x less weight traffic") overstates the payoff. Sober analysis:
+Measured XMX peak on B70 (`docs/xmx-probe/xmx_peak_int8_vs_fp16.cpp`, register-resident mad chain,
+no memory traffic):
 
-- oneDNN prefill at `-ub 512/2048` is XMX-compute-bound on the F16 GEMM, not dequant-bound. Dequant
-  is a measured **23.7% of prefill** (AoS), separate from the GEMM.
-- A fused Q2_0 XMX GEMM eliminates the dequant kernel (23.7%) and the F16 write, but the matmul
-  itself still has to be done on XMX - same MACs as oneDNN.
-- **Best case, IF the hand-rolled XMX GEMM matches oneDNN's throughput: ~1.3x prefill** (save the
-  ~24% dequant). Not 9x. The "9x less weight data" only applies to the dequant portion.
+| path | peak |
+| --- | ---: |
+| int8 DPAS | **358 TOPS** |
+| fp16 DPAS | 183 TOPS |
+| ratio | **1.95x** |
 
-And matching oneDNN is the hard part: oneDNN's GEMM is heavily tuned; the naive kernel here is
-~100x off. A competitive hand-rolled quantized XMX GEMM is research-grade, multi-session work.
+So int8 XMX genuinely runs ~2x fp16 on Battlemage. Ceiling from the prefill profile (section 4):
+the XMX GEMM only touches the MUL_MAT part - dequant 23.7% + DNNL fp16 gemm 32.6% = **56% of
+prefill**; the other ~44% (delta-net, attention, norms) is untouched (Amdahl bound).
 
-**Recommendation: item 1 is a bounded ~1.3x prefill win requiring high-effort, uncertain kernel
-engineering. Correctness and feasibility are fully proven. Whether to push the GEMM tuning is a
-value call - the effort/reward is materially worse than tonight's config and kernel wins
-(concat +8%, dequant +16%, ub +35%), which were cheap and are already deployed.** Suggest treating
-item 1 as a research track, not a near-term deploy target. The proven probes + design are a solid
-foundation if/when it is picked up.
+- dequant (23.7%) -> fused away -> 0
+- fp16 gemm (32.6%) -> int8 gemm at ~2x -> ~16%
+- + activation int8 quant -> ~3%
+- MUL_MAT portion: 56% -> ~19%; **prefill 100 -> ~63% -> ~1.6x** (916 -> ~1450 t/s equivalent).
+
+**~1.6x prefill is the biggest single win available - larger than anything deployed tonight.** The
+earlier "~1.3x" undercounted (forgot int8's 2x throughput). The catch is unchanged: realizing it
+needs the int8 kernel to reach a good fraction of its 358 TOPS peak. The naive tiled kernel hit
+1.7 TOPS = **0.5% of peak**; getting to ~50-70% (competitive with oneDNN's tuned fp16 efficiency)
+is the hard, uncertain engineering.
+
+**Honest synthesis: high reward (~1.6x prefill), high effort, uncertain (must reach good peak
+fraction). Not "poor effort/reward" - it is the biggest lever, gated behind real kernel work.**
+Correctness + feasibility + peak are all proven; the open question is purely whether a tuned kernel
+reaches competitive efficiency. That is the next concrete step: engineer the amortized kernel
+(weights expanded once per N-tile, reused across M; minimal barriers; larger tiles) and measure its
+TOPS. If it clears ~150 TOPS it wins; if it stalls at tens of TOPS, stop.
