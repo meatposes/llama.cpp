@@ -608,7 +608,7 @@ Sweep against a realistic multi-turn workload and measure both throughput and TT
 P0 - free, no rebuild:
 
 1. ~~`-ctk q8_0 -ctv q8_0`.~~ DONE - **rejected**, -41% TG at d=32768. Keep F16 KV. See section 3.
-2. Sweep `-cms` / `-ctxcp` against a multi-turn workload.
+2. ~~Sweep `-cms` / `-ctxcp`.~~ **DONE - throughput-neutral, keep defaults (section 3b/4).**
 3. Build a benchmark that mirrors the deployment (`-c`, `n_parallel`, graph, prompt cache) and
    re-baseline. The 861/42.1 numbers are not what production does.
 
