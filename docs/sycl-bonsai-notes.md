@@ -55,7 +55,9 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
 
 - `-c 131072` -> **8 GiB** of KV, on top of 6.7 GiB of weights. Fits a B70; `-fit on` is
   silently adjusting.
-- **Does not fit a B50 (16 GiB).** KV quantization is mandatory there, not optional.
+- **B50 (16 GiB) is tight at `-c 131072`**: 6.7 + 8 + compute buffers ~= 15.7 GiB, marginal to
+  OOM. Fix it with **less context, not quantized KV** - q8_0 KV costs ~41% TG at depth on this
+  model (see section 3). F16 at `-c 65536` is 4 GiB and fits comfortably.
 
 ---
 
