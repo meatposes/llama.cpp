@@ -296,6 +296,21 @@ static __dpct_inline__ void dequantize_q1_0(const void *vx, const int64_t ib,
     v.y() = (2 * bit_1 - 1) * d;
 }
 
+static __dpct_inline__ void dequantize_q2_0(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const dfloat d = x[ib].d;
+
+    // iqs: element index within block (even, 0..QK2_0-2)
+    // 4 elements per byte at 2 bits each
+    const int byte_idx = iqs / 4;
+    const int raw0 = (x[ib].qs[byte_idx] >> ((iqs % 4) * 2)) & 3;
+    const int raw1 = (x[ib].qs[byte_idx] >> (((iqs + 1) % 4) * 2)) & 3;
+
+    v.x() = (dfloat)(raw0 - 1) * d;
+    v.y() = (dfloat)(raw1 - 1) * d;
+}
+
 static __dpct_inline__ void dequantize_nvfp4(const void *vx, const int64_t ib,
                                              const int iqs, dfloat2 &v) {
     const block_nvfp4 & xb = ((const block_nvfp4 *) vx)[ib];
@@ -737,6 +752,32 @@ static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * 
         y_ptr[l] = d * qs[l];
     }
 
+}
+
+template<typename dst_t>
+static void dequantize_block_q2_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                  const sycl::nd_item<3> &item_ct1) {
+    const int64_t i      = item_ct1.get_group(2);
+    const int64_t tid    = item_ct1.get_local_id(2);
+    const int lane_ib    = i * WARP_SIZE + tid;
+    const int64_t nblocks = k / QK2_0;
+
+    if (lane_ib >= nblocks) {
+        return;
+    }
+
+    dst_t * y_ptr = yy + lane_ib * QK2_0;
+
+    // Q2_0 SoA: qs region is [nblocks * 32] bytes, d region follows
+    const uint8_t  * qs    = (const uint8_t *)vx + lane_ib * (QK2_0 / 4);
+    const sycl::half * s_ptr = (const sycl::half *)((const uint8_t *)vx + nblocks * (QK2_0 / 4)) + lane_ib;
+
+    const float d = float(*s_ptr);
+
+    for (int l = 0; l < QK2_0; ++l) {
+        const int raw = (qs[l / 4] >> ((l % 4) * 2)) & 0x03;
+        y_ptr[l]      = d * (raw - 1);
+    }
 }
 
 template<typename dst_t>

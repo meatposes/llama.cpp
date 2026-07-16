@@ -485,9 +485,12 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
     if (!g_ggml_sycl_disable_optimize) {
         // set reorder extra buffer based on supported type
         switch (tensor->type) {
+            case GGML_TYPE_Q2_0:
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:{
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
@@ -900,6 +903,7 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
@@ -3539,9 +3543,13 @@ enum class mul_mat_algo {
 };
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    switch (type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
@@ -3561,6 +3569,7 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
 
 inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return true;
@@ -3571,6 +3580,7 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
 
 inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q3_K:
@@ -3741,6 +3751,45 @@ static bool reorder_qw_q8_0(uint8_t * data_device, const int ncols, const int nr
             for (int j = 0; j < QK8_0; j++)
             {
                 *((int8_t*)qs_ptr + ib * QK8_0 + j) = x[ib].qs[j];
+            }
+            *(d_ptr + ib) = x[ib].d;
+        });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
+static bool reorder_qw_q2_0(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
+                            dpct::queue_ptr stream) {
+    sycl_reorder_temp_buffer tmp(stream, size);
+    if (!tmp) {
+        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
+        return false;
+    }
+    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
+
+    sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
+    if (!g_ggml_sycl_use_async_mem_op) {
+        copy_event.wait();
+    }
+
+    GGML_ASSERT((size % sizeof(block_q2_0) == 0));
+    GGML_ASSERT((offset % sizeof(block_q2_0) == 0));
+    int offset_blks = offset / sizeof(block_q2_0);
+    // Q2_0 SoA: 32 bytes packed qs per block, then all scales
+    auto qs_ptr = data_device + offset_blks * (QK2_0 / 4);
+    auto d_ptr  = (sycl::half *)(qs_ptr + (size_t)(ncols / 4) * nrows) + offset_blks;
+
+    auto reorder_event = stream->parallel_for(
+        size / sizeof(block_q2_0),
+        [=](auto i) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const block_q2_0 * x  = (const block_q2_0 *) tmp_buf;
+            const int          ib = i;
+
+            for (int j = 0; j < QK2_0 / 4; j++) {
+                qs_ptr[ib * (QK2_0 / 4) + j] = x[ib].qs[j];
             }
             *(d_ptr + ib) = x[ib].d;
         });
@@ -3949,6 +3998,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     size_t size = ggml_nbytes(src0);
 
     switch (src0->type) {
+        case GGML_TYPE_Q2_0:
+            return reorder_qw_q2_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_Q4_0:
             return reorder_qw_q4_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_Q8_0:
@@ -4989,10 +5040,9 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
             default:
                 break;
             case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
+                // concat.cpp uses an in-order queue with async memcpy (no blocking .wait()),
+                // so CONCAT is graph-compatible.
+                break;
             case GGML_OP_MUL_MAT_ID:
                 // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
                 // submitting a memcpy operation, but wait() can't be called on a queue that
@@ -5308,6 +5358,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_IQ2_XXS:

@@ -479,6 +479,122 @@ static __dpct_inline__ float vec_dot_q8_0_q8_1_mul_mat(
          y_df[j * (WARP_SIZE/QI8_1) + k/QI8_1]);
 }
 
+// ── Q2_0 MMQ tile functions ─────────────────────────────────────────────────
+// Design:  qi = WARP_SIZE (blocks_per_warp = 1), qr = 2, vdr = 1
+//   x_ql stride = 2*WARP_SIZE+1 stores 2-bit data expanded to int8-per-element
+//   qr=2 gives two ir rounds that together cover all 4 Q8_1 sub-blocks of one Q2_0 block.
+
+template <int mmq_y>
+static __dpct_inline__ void
+allocate_tiles_q2_0(int **x_ql, sycl::half2 **x_dm, int **x_qh, int **x_sc,
+                    int *tile_x_qs_q2_0, float *tile_x_d_q2_0) {
+    (void)x_qh; (void)x_sc;
+
+    *x_ql = tile_x_qs_q2_0;
+    *x_dm = (sycl::half2 *)tile_x_d_q2_0;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __dpct_inline__ void
+load_tiles_q2_0(const void *__restrict__ vx, int *__restrict__ x_ql,
+                sycl::half2 *__restrict__ x_dm, int *__restrict__ x_qh,
+                int *__restrict__ x_sc, const int &i_offset, const int &i_max,
+                const int &k, const int &blocks_per_row) {
+    (void)x_qh; (void)x_sc;
+
+    GGML_SYCL_ASSUME(i_offset >= 0);
+    GGML_SYCL_ASSUME(i_offset <  nwarps);
+    GGML_SYCL_ASSUME(k >= 0);
+    GGML_SYCL_ASSUME(k <  WARP_SIZE);
+
+    // QI2_0_MMQ = WARP_SIZE: 1 Q2_0 block per outer iteration.
+    // Thread k expands bytes [2k, 2k+1] of the block into 2 packed int32s of int8.
+    const block_q2_0 *bx0 = (const block_q2_0 *)vx;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = sycl::min(i, i_max);
+        }
+
+        const block_q2_0 *bxi = bx0 + i * blocks_per_row; // kbx=0: 1 block per warp
+
+        const uint8_t b0 = bxi->qs[2 * k    ];
+        const uint8_t b1 = bxi->qs[2 * k + 1];
+
+        // Expand 4×2-bit per byte into 4 int8s packed in one int32 (raw values 0..3).
+        auto expand_byte = [](uint8_t b) -> int {
+            return  (int)(b & 0x03)
+                 | ((int)((b >> 2) & 0x03) <<  8)
+                 | ((int)((b >> 4) & 0x03) << 16)
+                 | ((int)((b >> 6) & 0x03) << 24);
+        };
+
+        x_ql[i * (2 * WARP_SIZE + 1) + 2 * k    ] = expand_byte(b0);
+        x_ql[i * (2 * WARP_SIZE + 1) + 2 * k + 1] = expand_byte(b1);
+    }
+
+    // Scale: 1 fp16 per Q2_0 block. QI2_0_MMQ = WARP_SIZE, blocks_per_tile_x_row = 1.
+    const int blocks_per_tile_x_row = 1; // WARP_SIZE / QI2_0_MMQ = 1
+    const int kbxd = 0;                  // k % blocks_per_tile_x_row
+    float *x_dmf = (float *)x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * WARP_SIZE) {
+        int i = i0 + i_offset * WARP_SIZE + k / blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = sycl::min(i, i_max);
+        }
+
+        const block_q2_0 *bxi = bx0 + i * blocks_per_row + kbxd;
+
+        // Index: i*(WARP_SIZE/QI2_0_MMQ) + i/QI2_0_MMQ + kbxd = i*1 + i/WARP_SIZE + 0
+        x_dmf[i + i / WARP_SIZE] = (float)bxi->d;
+    }
+}
+
+static __dpct_inline__ float vec_dot_q2_0_q8_1_mul_mat(
+    const int *__restrict__ x_ql, const sycl::half2 *__restrict__ x_dm,
+    const int *__restrict__ x_qh, const int *__restrict__ x_sc,
+    const int *__restrict__ y_qs, const sycl::half2 *__restrict__ y_ds,
+    const int &i, const int &j, const int &k) {
+    (void)x_qh; (void)x_sc;
+
+    const float *x_dmf = (const float *)x_dm;
+
+    // x_ql at stride 2*WARP_SIZE+1; thread k owns positions 2k and 2k+1.
+    // y_qs at stride WARP_SIZE; (2k)%WARP_SIZE and (2k+1)%WARP_SIZE wrap correctly
+    // across the two ir rounds (qr=2) thanks to the generic template's barrier + y reload.
+    const int u0 = y_qs[j * WARP_SIZE + (2 * k    ) % WARP_SIZE];
+    const int u1 = y_qs[j * WARP_SIZE + (2 * k + 1) % WARP_SIZE];
+
+    int sumi = 0;
+    sumi = dpct::dp4a(x_ql[i * (2 * WARP_SIZE + 1) + 2 * k    ], u0, sumi);
+    sumi = dpct::dp4a(x_ql[i * (2 * WARP_SIZE + 1) + 2 * k + 1], u1, sumi);
+
+    // Q2_0 scale: x_dmf[i + i/WARP_SIZE]  (1 scale per block, i < mmq_y)
+    const float d_q2_0 = x_dmf[i + i / WARP_SIZE];
+
+    // Q8_1 d scale: y_ds[idx].x()
+    // Slot index matches the y-ds load in mul_mat_q (ir*(WARP_SIZE/QI8_1) + kby).
+    // For k in [0,4) → Q8_1 sub-block 0; [4,8) → 1; [8,12) → 2 (reloaded); [12,16) → 3.
+    const int y_ds_idx = j * (WARP_SIZE / QI8_1) + (2 * k / QI8_1) % (WARP_SIZE / QI8_1);
+    const float d8 = y_ds[y_ds_idx].convert<float, sycl::rounding_mode::automatic>().x();
+
+    // sumi = Σ raw_i * q8_i (raw ∈ {0..3}, true weight = raw - 1).
+    // Bias correction: Σ (raw-1)*q8 = sumi - Σq8[0..7].
+    // Σq8[0..7] computed via dp4a with all-ones vector — exact for these 8 elements,
+    // avoids the over-counting that would result from using m = d8 * Σq8[0..31].
+    int q8_sum = 0;
+    q8_sum = dpct::dp4a(0x01010101, u0, q8_sum);
+    q8_sum = dpct::dp4a(0x01010101, u1, q8_sum);
+
+    return d_q2_0 * d8 * ((float)sumi - (float)q8_sum);
+}
+
 template <int mmq_y>
 static __dpct_inline__ void
 allocate_tiles_q2_K(int **x_ql, sycl::half2 **x_dm, int **x_qh, int **x_sc,
@@ -1332,6 +1448,51 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
             dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE][j/nwarps];
         }
     }
+}
+
+#define  MMQ_X_Q2_0_RDNA2  64
+#define  MMQ_Y_Q2_0_RDNA2  128
+#define NWARPS_Q2_0_RDNA2  8
+#define  MMQ_X_Q2_0_RDNA1  64
+#define  MMQ_Y_Q2_0_RDNA1  64
+#define NWARPS_Q2_0_RDNA1  8
+#if defined(SYCL_USE_XMX)
+#define  MMQ_X_Q2_0_AMPERE 4
+#define  MMQ_Y_Q2_0_AMPERE 32
+#define NWARPS_Q2_0_AMPERE 4
+#else
+#define  MMQ_X_Q2_0_AMPERE 16
+#define  MMQ_Y_Q2_0_AMPERE 64
+#define NWARPS_Q2_0_AMPERE 4
+#endif
+#define  MMQ_X_Q2_0_PASCAL 64
+#define  MMQ_Y_Q2_0_PASCAL 64
+#define NWARPS_Q2_0_PASCAL 8
+
+template <bool need_check> static void
+mul_mat_q2_0(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst,
+    const sycl::nd_item<3> &item_ct1, int *tile_x_qs_q2_0, float *tile_x_d_q2_0,
+    int *tile_y_qs, sycl::half2 *tile_y_ds) {
+    int   * tile_x_ql = nullptr;
+    sycl::half2 *tile_x_dm = nullptr;
+    int   * tile_x_qh = nullptr;
+    int   * tile_x_sc = nullptr;
+
+    const int mmq_x  =  MMQ_X_Q2_0_AMPERE;
+    const int mmq_y  =  MMQ_Y_Q2_0_AMPERE;
+    const int nwarps = NWARPS_Q2_0_AMPERE;
+
+    allocate_tiles_q2_0<mmq_y>(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc,
+                               tile_x_qs_q2_0, tile_x_d_q2_0);
+
+    // qk=QK2_0=128, qr=2 (2 ir rounds to cover 4 Q8_1 sub-blocks), qi=WARP_SIZE (1 block/warp)
+    mul_mat_q<QK2_0, 2, WARP_SIZE, true, block_q2_0, mmq_x, mmq_y, nwarps,
+              load_tiles_q2_0<mmq_y, nwarps, need_check>, VDR_Q2_0_Q8_1_MMQ,
+              vec_dot_q2_0_q8_1_mul_mat>(
+        vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, tile_x_ql,
+        tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
 }
 
 #define  MMQ_X_Q4_0_RDNA2  64
@@ -2345,6 +2506,106 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+static void ggml_mul_mat_q2_0_q8_1_sycl(const void *vx, const void *vy,
+                                        float *dst, const int ncols_x,
+                                        const int nrows_x, const int ncols_y,
+                                        const int nrows_y, const int nrows_dst,
+                                        dpct::queue_ptr stream) try {
+
+    int id;
+    SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
+    const int compute_capability = ggml_sycl_info().devices[id].cc;
+
+    int mmq_x, mmq_y, nwarps;
+    if (compute_capability >= VER_GEN13) {
+        mmq_x  =  MMQ_X_Q2_0_RDNA2;
+        mmq_y  =  MMQ_Y_Q2_0_RDNA2;
+        nwarps = NWARPS_Q2_0_RDNA2;
+    } else if (compute_capability >= VER_GEN12) {
+        mmq_x  =  MMQ_X_Q2_0_RDNA1;
+        mmq_y  =  MMQ_Y_Q2_0_RDNA1;
+        nwarps = NWARPS_Q2_0_RDNA1;
+    } else if (compute_capability >= VER_GEN9) {
+        mmq_x  =  MMQ_X_Q2_0_AMPERE;
+        mmq_y  =  MMQ_Y_Q2_0_AMPERE;
+        nwarps = NWARPS_Q2_0_AMPERE;
+    } else if (compute_capability >= VER_4VEC) {
+        mmq_x  =  MMQ_X_Q2_0_PASCAL;
+        mmq_y  =  MMQ_Y_Q2_0_PASCAL;
+        nwarps = NWARPS_Q2_0_PASCAL;
+    } else {
+        GGML_ABORT("fatal error");
+    }
+
+    const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+    const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+    const sycl::range<3> block_nums(1, block_num_y, block_num_x);
+    const sycl::range<3> block_dims(1, nwarps, WARP_SIZE);
+
+    if (nrows_x % mmq_y == 0) {
+        const bool need_check = false;
+        {
+            dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
+            stream->submit([&](sycl::handler &cgh) {
+                // x_ql: expanded 2-bit→int8 at stride 2*WARP_SIZE+1
+                sycl::local_accessor<int, 1> tile_x_qs_q2_0_acc_ct1(
+                    sycl::range<1>(mmq_y * (2 * WARP_SIZE + 1)), cgh);
+                // x_d: 1 scale per block row, with i/WARP_SIZE padding
+                sycl::local_accessor<float, 1> tile_x_d_q2_0_acc_ct1(
+                    sycl::range<1>(mmq_y + mmq_y / WARP_SIZE), cgh);
+                sycl::local_accessor<int, 1> tile_y_qs_acc_ct1(
+                    sycl::range<1>(mmq_x * WARP_SIZE), cgh);
+                sycl::local_accessor<sycl::half2, 1> tile_y_ds_acc_ct1(
+                    sycl::range<1>(mmq_x * WARP_SIZE / QI8_1), cgh);
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        mul_mat_q2_0<need_check>(
+                            vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                            nrows_dst, item_ct1,
+                            get_pointer(tile_x_qs_q2_0_acc_ct1),
+                            get_pointer(tile_x_d_q2_0_acc_ct1),
+                            get_pointer(tile_y_qs_acc_ct1),
+                            get_pointer(tile_y_ds_acc_ct1));
+                    });
+            });
+        }
+    } else {
+        const bool need_check = true;
+        {
+            dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
+            stream->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<int, 1> tile_x_qs_q2_0_acc_ct1(
+                    sycl::range<1>(mmq_y * (2 * WARP_SIZE + 1)), cgh);
+                sycl::local_accessor<float, 1> tile_x_d_q2_0_acc_ct1(
+                    sycl::range<1>(mmq_y + mmq_y / WARP_SIZE), cgh);
+                sycl::local_accessor<int, 1> tile_y_qs_acc_ct1(
+                    sycl::range<1>(mmq_x * WARP_SIZE), cgh);
+                sycl::local_accessor<sycl::half2, 1> tile_y_ds_acc_ct1(
+                    sycl::range<1>(mmq_x * WARP_SIZE / QI8_1), cgh);
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        mul_mat_q2_0<need_check>(
+                            vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                            nrows_dst, item_ct1,
+                            get_pointer(tile_x_qs_q2_0_acc_ct1),
+                            get_pointer(tile_x_d_q2_0_acc_ct1),
+                            get_pointer(tile_y_qs_acc_ct1),
+                            get_pointer(tile_y_ds_acc_ct1));
+                    });
+            });
+        }
+    }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
                                         float *dst, const int ncols_x,
                                         const int nrows_x, const int ncols_y,
@@ -2985,6 +3246,9 @@ void ggml_sycl_op_mul_mat_q(
     const int64_t nrows_dst = device_id == ctx.device ? ne0 : row_diff;
 
     switch (src0->type) {
+        case GGML_TYPE_Q2_0:
+            ggml_mul_mat_q2_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
+            break;
         case GGML_TYPE_Q4_0:
             ggml_mul_mat_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, src1_ncols, src1_padded_row_size, nrows_dst, stream);
             break;

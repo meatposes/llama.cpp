@@ -155,6 +155,27 @@ template <> struct block_q_t<GGML_TYPE_Q6_K> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_Q2_0> {
+    struct traits {
+        static constexpr uint32_t qk       = QK2_0;   // 128
+        static constexpr uint32_t qi       = QI2_0;   // 4 (= QK2_0/32, one iqs step per Q8_1 sub-block)
+        static constexpr uint32_t qr       = QR2_0;   // 1
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    // Q2_0 reorder layout: [qs0[32]|...|qsN[32]][d0|...|dN]
+    // 32 bytes of packed 2-bit data per block (QK2_0=128 elements, 4 per byte)
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (QK2_0 / 4), 0 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / 4 * nrows) + block_index * (int)sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return QK2_0 / QK8_1; }  // 4
+};
+
 template <> struct block_q_t<GGML_TYPE_Q8_0> {
     struct traits {
         static constexpr uint32_t qk       = QK8_0;      // 32

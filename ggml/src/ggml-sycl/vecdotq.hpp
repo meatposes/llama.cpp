@@ -361,6 +361,39 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
     };
 };
 
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q2_0> {
+    static constexpr ggml_type gtype = GGML_TYPE_Q2_0;
+
+    using q2_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q2_0>;
+    using q2_0_traits = typename q2_0_block::traits;
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        // iqs in {0,1,2,3}: selects which 32-element sub-block (8 bytes) within the Q2_0 block
+        const uint8_t * qs  = base + ibx_offset.first + iqs * 8;
+        const ggml_half  d  = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
+
+        const int *       q8  = reinterpret_cast<const int *>(q8_1_quant_ptr + iqs * QK8_1);
+        const sycl::half2 ds8 = q8_1_ds[iqs];
+
+        int sumi = 0;
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const uint8_t bv = qs[b];
+            const int vi = (int)(bv & 0x03)
+                         | ((int)((bv >> 2) & 0x03) << 8)
+                         | ((int)((bv >> 4) & 0x03) << 16)
+                         | ((int)((bv >> 6) & 0x03) << 24);
+            sumi = dpct::dp4a(vi, q8[b], sumi);
+        }
+
+        const sycl::float2 ds8f = ds8.convert<float, sycl::rounding_mode::automatic>();
+        return static_cast<float>(d) * (ds8f.x() * static_cast<float>(sumi) - ds8f.y());
+    }
+};
+
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
     static constexpr ggml_type gtype = GGML_TYPE_Q8_0;
 
@@ -620,6 +653,40 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
             vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
     }
 };
+#define VDR_Q2_0_Q8_1_MMVQ 1
+#define VDR_Q2_0_Q8_1_MMQ  1
+
+static __dpct_inline__ float
+vec_dot_q2_0_q8_1(const void * __restrict__ vbq,
+                  const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq;
+
+    // iqs ∈ {0,1,2,3}: 32-element sub-block index within the 128-element Q2_0 block.
+    const float d = (float)bq2_0->d;
+    const sycl::float2 ds8f = bq8_1[iqs].ds.convert<float, sycl::rounding_mode::automatic>();
+
+    const uint8_t * qs = bq2_0->qs + iqs * 8;
+    const int     * q8 = (const int *)(bq8_1[iqs].qs);
+
+    int sumi = 0;
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        // Expand 4×2-bit Q2_0 values into 4 separate int8 bytes in one int32 for dp4a.
+        // Raw values 0-3 are non-negative so sign extension is not a concern.
+        const uint8_t bv = qs[b];
+        const int vi = (int)(bv & 0x03)
+                     | ((int)((bv >> 2) & 0x03) << 8)
+                     | ((int)((bv >> 4) & 0x03) << 16)
+                     | ((int)((bv >> 6) & 0x03) << 24);
+        sumi = dpct::dp4a(vi, q8[b], sumi);
+    }
+
+    // sumi = Σ raw_i * q8_i  (raw ∈ {0,1,2,3})
+    // True weight = (raw - 1) * d, so: Σ(raw-1)*q8 = Σ raw*q8 - Σ q8
+    // ds8f.y() = d8 * Σ q8_i, so correction = d * ds8f.y()
+    return d * (ds8f.x() * (float)sumi - ds8f.y());
+}
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
