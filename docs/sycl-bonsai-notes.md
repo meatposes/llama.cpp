@@ -827,3 +827,29 @@ per-(m,n) scaling must go through SLM (validated in 2b), not an in-register appl
 Risk: the per-32-K outer-product scaling may erode the XMX throughput advantage. Item 2's finding
 (prefill is dequant-traffic-bound, not compute-bound) is what makes this worth it - deleting the
 54 GB F16 write is the win even if the GEMM itself is only par with oneDNN.
+
+### Increment 3b - full tiled benchmark: correct at scale, naive perf is ~100x off
+
+Built a full tiled kernel on a real Bonsai size (ffn_up: K=5120, N=17408, M=512).
+`docs/xmx-probe/q2_tiled_bench_naive.cpp`.
+
+- **Correctness: PASS at scale** (maxrel 0 on random spot-checks).
+- **Perf: 55 ms/iter, ~0.43 GB/s effective weight reads (460 GB/s ceiling) - ~100x too slow.**
+  Not memory-bound; catastrophically overhead-bound.
+
+Root cause (diagnosed, not yet fixed):
+1. **Redundant weight expansion.** Each weight block is expanded to int8+VNNI in SLM by *every*
+   m-tile sub-group. With M=512 that is 64 re-expansions of the same weights. The expansion, not
+   the XMX mad, dominates.
+2. **Barrier storm.** 2 `group_barrier`s per 32-K sub-block x 160 sub-blocks per 8x16 tile. The
+   arithmetic intensity is terrible: one 8x16x32 int8 mad (4096 MACs) per ~768 B of SLM shuffle
+   plus 2 barriers.
+
+Fix direction (the real GEMM engineering): each sub-group owns one N-tile and loops **all** M,
+expanding each weight block **once** and reusing it across the M/8 m-tiles - amortizes expansion
+64x. Needs a strip of accumulators in SLM (e.g. 8 m-tiles = 4 KB/sub-group), larger register
+tiles, and minimal barriers. Standard for a production quantized XMX GEMM, but real work.
+
+**GO/NO-GO verdict: still open.** The naive kernel does NOT prove the approach is slow - it proves
+this structure is wrong. A properly-amortized kernel is required before comparing to oneDNN's ~916.
+This is the multi-session engineering flagged from the start.
