@@ -521,6 +521,14 @@ Follow-ups this opens:
   - MMVQ would still win at 64, and even at 128 (261.8) it would be close. **Revisit:** extending
   to 64 looks worth ~1.5x in the 33-64 band. It was deprioritized only because the band is
   narrower than the 9-32 one and costs 32 more instantiations per type. Not a settled "no".
+
+  **DECISION 2026-07-16: do NOT implement now.** Checked when batch 33-64 actually occurs in this
+  deployment: never. `n_parallel=4` caps the decode batch at 4, and prefill uses `-ub 2048` ->
+  oneDNN. MMVQ only ever sees batch <=4 here, so both the 8->32 cap *and* any 33-64 extension are
+  inert for this config - they matter only with high `n_parallel`, speculative decoding, or a small
+  ubatch. The 8->32 change stays (correct and free when the band is hit), but extending
+  `switch_ncols` to 64 (~32 x 18 = ~576 added instantiations, big build-time and .so cost) is not
+  justified until a workload actually produces batches >32.
 - **ub=24 (168) is below ub=16 (190) and ub=32 (204).** Non-monotonic; likely a tail/occupancy
   effect on a non-power-of-2 ncols. Minor, but it means the MMVQ ncols kernels are not uniformly
   tuned.
