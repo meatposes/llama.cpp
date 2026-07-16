@@ -806,14 +806,20 @@ implementation cost, same problem CUDA `mmq.cuh` Q2_0 already solves (structural
 2b. [DONE] Fused single kernel: XMX -> SLM int32 -> scale by dx per sub-block -> dw multiply, vs
     CPU ref - PASS maxerr 0 (`docs/xmx-probe/q2_fused_slm.cpp`). The full kernel math and the SLM
     scaling pattern are proven.
-3. [NEXT] Full-matrix standalone: read real `block_q2_0` (34-byte AoS or the SoA reorder layout),
-   on-device expand+VNNI-pack into SLM, K-loop over all blocks, M/N tiling for arbitrary sizes.
-   Design fork to decide here: feed the XMX kernel from AoS `block_q2_0` or from the SoA reorder
-   region. AoS keeps `d`+`qs` together (one stream, good for the expand); SoA is what MMVQ needs.
-   Since XMX prefill and MMVQ decode are different dispatch paths, the XMX kernel can read AoS
-   directly and leave the SoA reorder untouched - likely the cleaner split.
-4. Wire into `ggml_sycl_op_mul_mat_q` behind an env flag, off by default; A/B vs oneDNN on the
-   server prefill path. Promote only if it beats ~916 (AoS ceiling) and stays correct.
+3. [DONE - core mechanics] On-device expand from real `block_q2_0`/`block_q8_1`, K-loop over
+   multiple blocks with per-block `d_w` folded into the SLM accumulation - PASS maxerr ~0.001
+   (`docs/xmx-probe/q2_ondevice_kloop.cpp`, K=256). Decided the design fork: **feed from AoS
+   `block_q2_0` directly** - XMX prefill and MMVQ decode are separate dispatch paths, so the XMX
+   kernel reads AoS and leaves the SoA reorder (which MMVQ needs) untouched. Cleaner split, and
+   AoS keeps `d`+`qs` in one stream for the expand.
+   Remaining for a full kernel: M/N tiling for arbitrary dims (standard GEMM grid + boundary
+   handling) - no novel mechanics left.
+4. [NEXT, supervised] Wire into `ggml_sycl_op_mul_mat_q` behind an env flag, off by default; A/B
+   vs oneDNN on the server prefill path. Promote only if it beats ~916 (AoS ceiling) and stays
+   correct. Touches live dispatch - do with supervision.
+
+**Status: every novel/risky mechanic of the XMX Q2_0 GEMM is proven with a passing standalone
+test. What is left is tiling boilerplate + the live-dispatch A/B.**
 
 Note: `joint_matrix_apply` in oneAPI 2026.1 exposes element values only, not coordinates, so
 per-(m,n) scaling must go through SLM (validated in 2b), not an in-register apply.
