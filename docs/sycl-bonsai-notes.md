@@ -920,3 +920,17 @@ Q8_1's per-32), and even then success is uncertain against oneDNN's years of tun
 probes and this measured plateau are the value: they close the question cheaply instead of after a
 multi-week kernel effort. **Item 1 is done - answered NO-GO, not abandoned.** Correctness,
 feasibility, peak, and the practical ceiling are all measured and recorded.
+
+### fp16-fused BUILT AND MEASURED - also NO-GO (2026-07-16)
+
+After the int8 NO-GO, the review proposed fp16-fused (in-register Q2_0->fp16 weight dequant, fp16
+activations, no per-sub-block scaling) as the lever that would dodge the int8 scale-stall. Built and
+measured (`docs/xmx-probe/q2_fp16_fused.cpp`): correct (maxrel 1e-5), **12.5 TOPS, 7.28 ms**. Barely
+faster than int8's 11.3 TOPS, ~10x off oneDNN's 124.7. **The scale-stall hypothesis was wrong** -
+the real wall is the per-tile weight-expansion-to-SLM + barrier overhead of a hand-rolled tiled
+GEMM, common to int8 and fp16. Does not beat the 1.11 ms current-path bar.
+
+**Final: full NO-GO for hand-rolled fused GEMM (int8 or fp16).** The ~1.3-1.6x ceiling is real but
+needs oneDNN-class GEMM engineering (register blocking, pipelining, no per-tile barriers) to reach -
+not a reasonable ask against oneDNN itself. Standalone dequant is bandwidth-bound at the ceiling
+(nothing left). Item 1 is fully closed.

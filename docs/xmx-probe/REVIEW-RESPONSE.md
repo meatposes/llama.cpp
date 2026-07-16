@@ -7,10 +7,13 @@ Reviewer verdict on `REVIEW-REQUEST.md`. Read the kernels and the peak bench dir
 1. **NO-GO for the int8-fused kernel: AGREE, now airtight.** Measured: oneDNN f16 GEMM is 10.9x
    faster on the matmul alone (0.732 ms vs 8.0 ms). The plateau is Q8_1's per-32-K scaling stalling
    the pipeline - a real architectural wall, not an unoptimized kernel.
-2. **BUT the broader "fused XMX GEMM isn't worth it" is TOO STRONG.** A different framing -
-   **fp16-fused with in-register weight dequant, no activation quantization** - sidesteps the exact
-   wall that killed int8. Lower ceiling (~1.3x, not 1.6x) but actually reachable. This was not
-   tried and is not on the "already tried" list. Details below.
+2. **fp16-fused: BUILT AND MEASURED 2026-07-16 - also NO-GO.** I proposed fp16-fused (in-register
+   weight dequant, fp16 activations, no per-sub-block scaling) as the lever that would dodge the
+   int8 scale-stall. Built it (`q2_fp16_fused.cpp`), correct (maxrel 1e-5): **12.5 TOPS, 7.28 ms**.
+   Barely faster than int8's 11.3 TOPS, and 10x off oneDNN's 124.7. **My hypothesis was wrong: the
+   scale-stall was NOT the bottleneck.** The real cost is common to both - a hand-rolled tiled GEMM
+   with per-tile weight-expansion to SLM + barrier runs at ~10% of oneDNN's efficiency regardless
+   of int8 vs fp16. Does not beat the 1.11 ms bar (it is 7.28 ms).
 
 ## Fact-check of the claims
 
@@ -41,7 +44,11 @@ Reviewer verdict on `REVIEW-REQUEST.md`. Read the kernels and the peak bench dir
   the ~44% delta-net/attention/norms is untouched, so even a free MUL_MAT caps at ~2.3x and the
   realistic int8 case is ~1.6x. Framing is right.
 
-## The lever that breaks the plateau (specific, implementable)
+## The proposed lever (fp16-fused) - BUILT, MEASURED, REFUTED
+
+I proposed this as the plateau-breaker. It is not. Measured 12.5 TOPS (`q2_fp16_fused.cpp`), ~10x
+off oneDNN, does not beat 1.11 ms. Kept below for the record; the mechanism was sound but the
+premise (scale-stall dominates) was wrong.
 
 **fp16-fused GEMM: dequant Q2_0 -> fp16 weights in-register, keep activations fp16, no int
 accumulation, no per-sub-block scaling.**
@@ -54,9 +61,12 @@ Mechanism - why it dodges the wall:
   per-32-K int32->float scale step that stalls the int8 kernel simply does not exist.
 - Store the f32 accumulator once at the end.
 
-Why it should reach a high peak fraction where int8 could not: it is the standard weight-only
-quantized GEMM pattern (Marlin / bitsandbytes / oneDNN weights-decompression on CUDA). Those reach
-70-90% of fp16 peak precisely because the decompress is amortized and the mad chain is unbroken.
+Claimed it should reach a high peak fraction (Marlin/bitsandbytes reach 70-90%). MEASURED IT DOES
+NOT: 12.5 TOPS = ~7% of fp16 peak, same ballpark as int8-fused. Marlin-class kernels achieve their
+numbers through register blocking, software pipelining, no per-tile barriers, and hand-tuned tile
+shapes - i.e. world-class GEMM engineering, not just "unbroken mad chain." My hand-rolled tiled
+structure (per-tile SLM expand + barrier, M8xN16 tile) is ~10x below oneDNN and the reframing did
+not change that.
 
 Ceiling: it gives up int8's 2x (so GEMM stays ~1x fp16), but it still deletes the dequant kernel
 (23.7%) and the 54 GB F16 global write. Net ceiling ~1/(1-0.237) = **~1.3x prefill**. Lower than
@@ -90,9 +100,12 @@ Current-path total for this GEMM = 0.732 ms (oneDNN GEMM) + 0.382 ms (SoA dequan
 **~1.11 ms**. fp16-fused must beat 1.11 ms *including* in-register dequant while hitting
 oneDNN-class GEMM efficiency.
 
-**Recommendation (final, measured): fp16-fused is the ONLY remaining lever for ~1.3x prefill;
-standalone-dequant optimization is exhausted (bandwidth ceiling); int8-fused is dead (11x). See the
-completed-baseline section for the full numbers.**
+**Recommendation (final, measured): FULL NO-GO for hand-rolled fused GEMM.** int8-fused: 11.3
+TOPS, ~11x off oneDNN. fp16-fused: BUILT AND MEASURED at 12.5 TOPS, ~10x off oneDNN - the reframing
+did not help, the scale-stall was not the bottleneck. Standalone-dequant optimization is exhausted
+(bandwidth ceiling). The ~1.3-1.6x ceiling is real but unreachable without oneDNN-class GEMM
+engineering (register blocking, pipelining, no per-tile barriers), which is not a reasonable ask
+against oneDNN itself. Nothing further to pursue here.
 
 ## Also worth stating plainly
 
@@ -125,12 +138,11 @@ at the ceiling, nothing left to get. The ~24% dequant cost can only be recovered
 i.e. fusion. So:
 
 - **item 2 (standalone dequant optimization) is EXHAUSTED** - it is bandwidth-bound and done.
-- **fp16-fused is the ONLY remaining lever for the ~1.3x** - dequant weights in-register (no 178 MB
-  write, no separate 0.4 ms pass), GEMM at fp16. It must match oneDNN's 124.7 TOPS GEMM efficiency
-  while folding in the dequant. If it lands at oneDNN-class GEMM speed, it saves the full 0.4 ms
-  dequant -> ~1.3x prefill. If it lands below oneDNN's GEMM, it can still win as long as
-  (fused time) < 1.11 ms (GEMM+dequant). That 1.11 ms is the hard bar.
+- **fp16-fused: BUILT AND MEASURED - also dead.** 12.5 TOPS, 7.28 ms, ~10x off oneDNN, does not
+  beat the 1.11 ms bar. The scale-stall hypothesis was wrong; the per-tile expand+barrier overhead
+  of a hand-rolled tiled GEMM is the real ~10x wall, common to int8 and fp16.
 - int8-fused: dead (measured 11x).
+- **Both fused variants require oneDNN-class GEMM engineering to reach the ~1.3x ceiling. NO-GO.**
 
 Note the fused kernel does NOT speed up the GEMM itself (compute-bound at 124 TOPS); it only
 removes the separate dequant pass and the F16 round-trip. So the entire prize is the 0.4 ms
