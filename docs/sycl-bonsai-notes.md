@@ -73,7 +73,8 @@ Committed on `sycl/bonsai-q2_0-perf`:
 | `sycl: raise MMVQ_MAX_BATCH_SIZE from 8 to 32` | validated 2026-07-16: ~2x at batch 16-32 |
 | `sycl: make the MMVQ batch cap runtime-tunable` | `GGML_SYCL_MMVQ_MAX_BATCH` |
 | `sycl: embed SPIR-V fallback alongside AOT` | `spir64_gen,spir64` + multi-device |
-| `sycl: fix work-group size in non-contiguous concat` | **+7% prefill**; generic backend fix |
+| `sycl: fix work-group size in non-contiguous concat` | **+8% prefill**; generic backend fix |
+| `sycl: normalize GGML_SYCL_DEVICE_ARCH for ocloc` | `_`->`-`; unblocks multi-device AOT |
 
 ### Build
 
@@ -84,8 +85,46 @@ Committed on `sycl/bonsai-q2_0-perf`:
     cmake --build build --config Release \
           --target ggml-sycl llama-server llama-bench -j$(nproc)
 
-AOT takes 20-60 min per device target. Output `.so` was ~193 MB for a single AOT target;
-expect roughly 2x for two, plus the spir64 fallback.
+AOT takes 20-60 min per device target. `.so` is **355 MB** for two targets + spir64 fallback
+(was 193 MB single-target). Both `Build succeeded for : bmg-g31.` and `bmg-g21.` should appear
+in the build log.
+
+**ocloc device-name trap (fixed in CMake, but know it exists):** ocloc acronyms are hyphenated
+(`bmg-g31`). The underscore form is an accepted alias *for a single device*, which is why
+`-device bmg_g31` always worked - but in a comma list ocloc drops the underscore and dies with
+`Failed to parse target : bmgg31 - invalid device`. The CMake now normalizes `_` -> `-`, so
+`GGML_SYCL_DEVICE_ARCH="bmg_g31,bmg_g21"` works. Verified against ocloc 26.22:
+
+| `-device` value | result |
+| --- | --- |
+| `bmg_g31` | OK (single underscore alias) |
+| `bmg-g31,bmg-g21` | OK |
+| `bmg_g31,bmg_g21` | FAIL |
+| `bmg-g31:bmg-g21` | OK (range) |
+
+### Image build + deploy
+
+    # .dockerignore has build*/ at line 11 - must be commented out for the COPY, then restored
+    docker build -f Dockerfile.mmq-test -t llama-cpp-intel:prism-concatfix .
+    docker tag llama-cpp-intel:prism-concatfix llama-cpp-bonsai:meat2
+
+Deployed 2026-07-16 as `llama-cpp-bonsai` on `llama-cpp-bonsai:meat2` (`06c007b37469`).
+Previous image `llama-cpp-bonsai:meat` (`6c00cd3a7690`) retained for rollback.
+
+Verified on the deployed image, AOT vs AOT:
+
+| test | `:meat` (old) | `:meat2` (new) | |
+| --- | ---: | ---: | ---: |
+| pp512 | 848.62 +/- 1.98 | **916.73 +/- 2.85** | **+8.0%** |
+| pp2048 | 812.43 +/- 1.23 | **876.51 +/- 1.18** | **+7.9%** |
+| tg128 | 41.58 +/- 0.07 | 41.94 +/- 0.10 | +0.9% |
+
+Cold start **2.95s** to model-loaded-and-listening, which also proves AOT is in use - a silent
+`spir64` JIT fallback would take ~90s. Startup reports `GGML_SYCL_F16: yes`,
+`GGML_SYCL_DNNL: yes`, `GGML_SYCL_MMVQ_MAX_BATCH: 32`.
+
+**JIT builds are a valid proxy for AOT perf.** The JIT A/B predicted pp512=916.83; AOT measured
+916.73. Use a JIT build (minutes) for future A/Bs instead of a 40-120 min AOT rebuild.
 
 `libdnnl.so.3` must be copied into the image at `/app/` (it is on `LD_LIBRARY_PATH`).
 Do **not** work around a missing DNNL by setting `GGML_SYCL_DNN=OFF` - that silently disables
