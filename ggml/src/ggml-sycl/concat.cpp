@@ -124,8 +124,10 @@ static void concat_T_sycl_non_cont(
     uint64_t nb11, uint64_t nb12, uint64_t nb13, int64_t ne0, int64_t ne1,
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
-  sycl::range<3> gridDim(ne3, ne2, ne1);
-  stream->parallel_for(sycl::nd_range<3>(gridDim, sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
+  // One work-group per (i3, i2, i1); the work-items of a group stride over ne0 below.
+  sycl::range<3> gridDim(ne3, ne2, ne1 * SYCL_CONCAT_BLOCK_SIZE);
+  stream->parallel_for(
+      sycl::nd_range<3>(gridDim, sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
       int64_t i3 = item_ct1.get_group(0);
       int64_t i2 = item_ct1.get_group(1);
       int64_t i1 = item_ct1.get_group(2);
