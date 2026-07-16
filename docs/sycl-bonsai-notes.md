@@ -599,7 +599,21 @@ prefill. llama-bench does none of this.
 a prompt-cache miss the only alternative to restoring a checkpoint is reprocessing the whole
 prompt. They are load-bearing for multi-turn TTFT. Tunables: `-ctxcp N`
 (`LLAMA_ARG_CTX_CHECKPOINTS`, default 32) and `-cms N` (`--checkpoint-min-step`, default 256).
-Sweep against a realistic multi-turn workload and measure both throughput and TTFT.
+
+**MEASURED 2026-07-16: checkpoint settings are throughput-neutral. Keep the defaults.** A 600-token
+generation at default / off / reduced:
+
+| setting | gen t/s |
+| --- | ---: |
+| default (32 cp, step 256) | 41.5 |
+| checkpoints OFF (`-ctxcp 0`) | 41.3 |
+| reduced (8 cp, step 512) | 41.2 |
+
+Within ~0.3%. Each 150 MB copy is ~0.33 ms at 460 GB/s and only ~2-3 fire per 600-token
+generation, so they do not slow decode. The "pure overhead" worry above (the 2.4 GiB figure) is
+real in bytes but overlaps compute and costs no measurable time. This run also pinned steady-state
+server TG at **41.5 t/s** (matching llama-bench); the 25.6 t/s in the very first investigation was
+a 5-token cold sample, not a real gap.
 
 ---
 
