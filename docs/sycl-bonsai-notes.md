@@ -67,7 +67,7 @@ Committed on `sycl/bonsai-q2_0-perf`:
 | --- | --- |
 | `sycl: add Q2_0 support` | dequant, get_rows, MMVQ, SoA reorder, dead MMQ case |
 | `sycl: drop blocking waits from contiguous concat` | graph-recording fix |
-| `sycl: raise MMVQ_MAX_BATCH_SIZE from 8 to 32` | **experimental, unvalidated** |
+| `sycl: raise MMVQ_MAX_BATCH_SIZE from 8 to 32` | validated 2026-07-16: ~2x at batch 16-32 |
 | `sycl: make the MMVQ batch cap runtime-tunable` | `GGML_SYCL_MMVQ_MAX_BATCH` |
 | `sycl: embed SPIR-V fallback alongside AOT` | `spir64_gen,spir64` + multi-device |
 
@@ -182,23 +182,46 @@ over PCIe it is ~15-30 ms, against a ~24 ms/token budget. The magnitude matches 
 
 Note the model card says the fork officially supports **CUDA and Metal only**. SYCL is ours.
 
-### Is MMVQ at batch 9-32 actually faster than oneDNN?
+### Is MMVQ at batch 9-32 actually faster than oneDNN? - ANSWERED: yes, ~2x
 
-`MMVQ_MAX_BATCH_SIZE 8 -> 32` was never measured. It is global: it changes dispatch for every
-quantized type on every Intel GPU. In `ggml_sycl_mul_mat` the `use_mul_mat_vec_q` branch is
-tested *before* the oneDNN fallback, so raising the cap diverts batches 9-32 off the F16 GEMM.
+**Measured 2026-07-16. Keep the cap at 32; do not revert `342202a46`.**
 
-The one relevant data point points the wrong way: pp32 measured 120 t/s under MMVQ while pp128
-measured 419 t/s under oneDNN. The 9-32 band is exactly what `n_parallel=4` serving and
-speculative decoding produce.
+Setup: B70 (`level_zero:1`), JIT build, F16 + DNNL on, FORCE_MMQ off, `-b 512 -p 512 -n 0 -r 3`,
+sweeping `-ub`. `ub=8` is the control: it is <= both caps, so it must land in the MMVQ path under
+each and come out identical. It did (-0.6%), which validates the design.
 
-Now testable without a rebuild:
+| n_ubatch | cap=8 (t/s) | cap=32 (t/s) | speedup | path under cap=8 |
+| ---: | ---: | ---: | ---: | --- |
+| 8 | 170.03 +/- 0.32 | 168.95 +/- 0.07 | 1.00x (control) | MMVQ (both) |
+| 16 | 84.12 +/- 0.24 | **189.96 +/- 0.10** | **2.26x** | oneDNN |
+| 24 | 93.41 +/- 0.01 | **168.08 +/- 0.04** | **1.80x** | oneDNN |
+| 32 | 98.24 +/- 0.02 | **204.21 +/- 0.09** | **2.08x** | oneDNN |
 
-    GGML_SYCL_MMVQ_MAX_BATCH=8   # upstream behaviour
-    GGML_SYCL_MMVQ_MAX_BATCH=32  # current default
+The prior suspicion that 32 was a regression came from an old `pp32 = 120 t/s` data point that
+predates the SoA reorder and F16. It was wrong.
 
-Sweep batch 4/8/16/24/32. If 32 loses, revert commit `342202a46`. If it wins only for Q2_0,
-make it per-type or arch-gated rather than a global.
+**Mechanism:** dequant+oneDNN must dequantize the *entire* weight matrix regardless of batch
+size. At ubatch 16 that means dequantizing ~6.7 GB of weights to serve a 16-column GEMM - fixed
+cost, negligible work. MMVQ reads the quantized weights directly and skips it. The same effect
+explains pp512 = 861 t/s: at ubatch 512 the dequant cost finally amortizes.
+
+**Scope:** the cap is irrelevant to normal prefill (ubatch 512 -> oneDNN wins by a wide margin).
+It matters for small-batch decode: `n_parallel` serving (batch = active slots) and speculative
+decoding (batch ~= draft block size 4-5). Both sit in the 2x band.
+
+Follow-ups this opens:
+
+- **The crossover is well above 32.** MMVQ@32 = 204 vs oneDNN@32 = 98, and oneDNN does not reach
+  861 until ubatch 512. 32 is not an optimum - it is just where `*_switch_ncols` stops
+  instantiating. Extending to 64 (and raising `MMVQ_MAX_BATCH_SIZE_LIMIT`) may gain more, at the
+  cost of more kernel instantiations, build time and `.so` size. Worth bisecting where MMVQ and
+  oneDNN actually cross.
+- **ub=24 (168) is below ub=16 (190) and ub=32 (204).** Non-monotonic; likely a tail/occupancy
+  effect on a non-power-of-2 ncols. Minor, but it means the MMVQ ncols kernels are not uniformly
+  tuned.
+
+Caveat: `llama-cpp-sycl` (spans `level_zero:0;1`) was resident but idle during these runs, so it
+held VRAM on the device. It affected both arms equally.
 
 ### Where does the time actually go?
 
@@ -241,7 +264,8 @@ P0 - free, no rebuild:
 
 P1 - cheap, resolves open questions:
 
-4. A/B `GGML_SYCL_MMVQ_MAX_BATCH` 8 vs 32 at batch 4/8/16/24/32.
+4. ~~A/B `GGML_SYCL_MMVQ_MAX_BATCH` 8 vs 32.~~ DONE - 32 wins ~2x at batch 16-32. Next: find the
+   real MMVQ/oneDNN crossover above 32 (needs `*_switch_ncols` instantiated past 32).
 5. Sweep `-ub` / `-b`. `n_ubatch=512` is an untouched default and 48 sequential-scan layers make
    512 non-obvious.
 6. Get a B50 baseline on the dual-arch build.
