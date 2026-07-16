@@ -203,15 +203,19 @@ if (GGML_SYCL_DEVICE_ARCH)
     else()
         set(GGML_SYCL_AOT_TARGETS "spir64_gen")
     endif()
-    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via ${GGML_SYCL_AOT_TARGETS})")
+    # ocloc device acronyms are hyphenated (bmg-g31). The underscore form is accepted
+    # as an alias for a single device, but inside a comma-separated list ocloc drops
+    # the underscore and fails with "invalid device: bmgg31", so normalize here.
+    string(REPLACE "_" "-" GGML_SYCL_OCLOC_DEVICES "${GGML_SYCL_DEVICE_ARCH}")
+    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} -> ocloc -device ${GGML_SYCL_OCLOC_DEVICES} (AOT via ${GGML_SYCL_AOT_TARGETS})")
     target_compile_options(
         ggml-sycl PRIVATE
         -fsycl-targets=${GGML_SYCL_AOT_TARGETS}
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_OCLOC_DEVICES}\""
     )
     target_link_options(
         ggml-sycl PRIVATE
         -fsycl-targets=${GGML_SYCL_AOT_TARGETS}
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_OCLOC_DEVICES}\""
     )
 endif()
