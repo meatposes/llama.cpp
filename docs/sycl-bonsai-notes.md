@@ -800,11 +800,23 @@ implementation cost, same problem CUDA `mmq.cuh` Q2_0 already solves (structural
 
 ### Plan (incremental, each gated on correctness vs CPU ref, none touching live dispatch)
 
-1. [DONE] int8 XMX probe.
-2. Standalone Q2_0-tile x Q8_1-tile -> float, one output tile, vs CPU reference.
-3. Full-matrix standalone (K-loop, tiling, SLM staging of expanded int8 + VNNI pack).
+1. [DONE] int8 XMX probe (`docs/xmx-probe/jm_int8_probe.cpp`).
+2a. [DONE] Q2_0 expand + VNNI + XMX int32 accumulation, host scaling, vs CPU ref - PASS maxerr 0
+    (`docs/xmx-probe/q2_int32_accum.cpp`).
+2b. [DONE] Fused single kernel: XMX -> SLM int32 -> scale by dx per sub-block -> dw multiply, vs
+    CPU ref - PASS maxerr 0 (`docs/xmx-probe/q2_fused_slm.cpp`). The full kernel math and the SLM
+    scaling pattern are proven.
+3. [NEXT] Full-matrix standalone: read real `block_q2_0` (34-byte AoS or the SoA reorder layout),
+   on-device expand+VNNI-pack into SLM, K-loop over all blocks, M/N tiling for arbitrary sizes.
+   Design fork to decide here: feed the XMX kernel from AoS `block_q2_0` or from the SoA reorder
+   region. AoS keeps `d`+`qs` together (one stream, good for the expand); SoA is what MMVQ needs.
+   Since XMX prefill and MMVQ decode are different dispatch paths, the XMX kernel can read AoS
+   directly and leave the SoA reorder untouched - likely the cleaner split.
 4. Wire into `ggml_sycl_op_mul_mat_q` behind an env flag, off by default; A/B vs oneDNN on the
-   server prefill path. Only promote if it beats ~916 (the AoS ceiling) and stays correct.
+   server prefill path. Promote only if it beats ~916 (AoS ceiling) and stays correct.
+
+Note: `joint_matrix_apply` in oneAPI 2026.1 exposes element values only, not coordinates, so
+per-(m,n) scaling must go through SLM (validated in 2b), not an in-register apply.
 
 Risk: the per-32-K outer-product scaling may erode the XMX throughput advantage. Item 2's finding
 (prefill is dequant-traffic-bound, not compute-bound) is what makes this worth it - deleting the
