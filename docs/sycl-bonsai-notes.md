@@ -974,11 +974,25 @@ SYCL resample (two-stage: per-work-group partial GEMV+argmax over vocab stripes,
 queue for the `prev` chain (out-of-order raced the dPrev write/read; the ggml SYCL backend queue is
 already in-order, so this is free in integration). The Markov head is no longer the bottleneck.
 
-Remaining: integration - implement `dspark_markov_sycl_init/resample/free` matching the CUDA
-interface in `common/dspark-markov.h`, add a `LLAMA_DSPARK_MARKOV_SYCL` path in `speculative.cpp`
-parallel to the CUDA one, wire CMake, rebuild the SYCL image, deploy, and measure dspark end-to-end
-(expect it to flip from -60% toward positive). Device memory for the two f32 factors is ~508 MB,
-fits the B70 alongside model+KV+drafter.
+### ACTUAL FIX: one line, not a new kernel (2026-07-16)
+
+Investigating the integration revealed a generic backend-agnostic Markov path ALREADY exists:
+`llama_context::dspark_markov_resample` (`src/llama-context.cpp:2595`) builds a ggml graph
+(get_rows(head_a) -> mul_mat(head_b) -> add(base) -> argmax, chained per block position) and runs
+it on `model.dev_output()` via `ggml_backend_sched` - i.e. on SYCL when the model is on SYCL. It
+falls back to the host path only when an op or type is unsupported.
+
+Root cause of the fallback: `supported_head_type` listed F32/F16/BF16/Q4_0/Q5_0/Q8_0 but **NOT
+Q4_1**, and the dspark model's `markov_head_b` is **Q4_1**. So the check failed and every round
+took the 113 ms host path. All four graph ops ARE supported on SYCL (get_rows BF16, mul_mat Q4_1,
+add, argmax - verified in ggml-sycl.cpp). **Fix = add Q4_1 (and Q5_1) to `supported_head_type`**
+(`src/llama-context.cpp:2618`). No new kernel file, no separate device backend - the existing
+generic path just needed the type allowed. My standalone SYCL probe (kept in
+`docs/dspark-markov-sycl/`, 1.87 ms) is now only a reference/validation of the math, not the fix.
+
+Rebuild is libllama + llama-server only (ggml-sycl `.so` unchanged), not the 40 min AOT. Then
+deploy with dspark re-enabled and measure - expect the Markov head to run on GPU (~1 ms/round
+instead of 113 ms) and dspark to flip from -60% toward the CUDA-side +34%.
 
 Note the confidence head (`dspark.confidence_head`) and the drafter forward also run per round;
 those are small (5376x1) and on the normal SYCL path. The Markov GEMV is the sole 254 MB CPU
