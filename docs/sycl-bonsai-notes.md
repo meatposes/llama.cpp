@@ -1059,3 +1059,39 @@ dspark works (markov fixed) but is net-negative at `-c 131072`: the drafter stag
 capacity per round (`n_batch -> 131076`, "full-context staging"), ~64 ms/token. dspark is a clear
 win only at moderate context (`-c 8192`: code +62%). So it is NOT enabled in the 128k deploy; the
 fix binary is in the image (`:meat4-dspark`) for smaller-context use.
+
+### B50 dspark findings (2026-07-16) - dspark unusable on B50, no-dspark works
+
+Tested deploying `:meat4-dspark` on the B50 (screamer). Results:
+
+**no-dspark: works cleanly.** `-c 65536 -np 1 -b 2048 -ub 2048 --no-warmup`, graph OFF: loads
+healthy, **20.8 t/s** (~half B70's 42, as expected). This is the recommended B50 config.
+
+**dspark: loads (with care) but is FUNCTIONALLY UNUSABLE.**
+- Fits only with `-np 1` (single slot). `-np 4` (default) OOMs/hangs at slot init on the 16 GB card
+  - model 6.7 + draft 2.8 + KV + a full-context staging buffer sized to the whole context.
+- Even when it loads, it is **<0.07 t/s** - a 12-token generation did not finish in 3 minutes.
+  Cause: dspark stages the ENTIRE context (`n_batch -> ctx+4`, e.g. 65540 at 64k) through the
+  drafter every draft round. On the slower B50 that is ~minutes per round. Cost scales with
+  context; the B50's usable dspark ceiling is ~4k at best, and even that is slow.
+- **Verdict: do NOT run dspark on the B50.** Use no-dspark there; test dspark on the B70 at small
+  context (`-c 8192`).
+
+**GPU-wedge hazard (important operational lesson).** Repeated dspark deploy attempts at
+64k/32k/16k produced `UR_RESULT_ERROR_DEVICE_LOST` (GPU job-timeout). Retrying on the same card
+compounded it - 128 job-timeouts in dmesg - until even a no-dspark load could not complete and the
+B50 needed a reboot to recover. **One DEVICE_LOST = STOP; do not retry on the same card.** After a
+reboot the fresh GPU + `-np 1` loaded dspark without wedging (0 timeouts), confirming the wedge was
+the retry-compounding, not a single dspark load.
+
+**B50 deploy (screamer), verified working:**
+
+    docker run -d --name bonsai --restart=no --device=/dev/dri \
+      -e ONEAPI_DEVICE_SELECTOR=level_zero:0 -e GGML_SYCL_VISIBLE_DEVICES=0 -e LLAMA_ARG_HOST=0.0.0.0 \
+      -p 8001:8080 -v ~/bonsai-models:/models \
+      llama-cpp-bonsai:meat4-dspark \
+      -m /models/Ternary-Bonsai-27B-Q2_0.gguf -ngl 99 -dev SYCL0 \
+      -c 65536 -np 1 -b 2048 -ub 2048 --no-warmup --reasoning off --port 8080
+
+Graph OFF (omit DISABLE_GRAPH), no dspark. Load takes several minutes on the slow Xeon host
+(use `--no-warmup`; healthcheck `start_period` >= 300s).
