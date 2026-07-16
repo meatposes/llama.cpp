@@ -1027,3 +1027,35 @@ The earlier single chat=2.8 t/s reading was a one-off glitch; warm it is 40.8/42
 Enable it in the bonsai container.** The old "0.85 acceptance" claim was likely an even-more-
 structured workload; the real range is 0.30-0.69, still a clear win where it matters. Single-GPU
 draft+verify still serialize, but the numbers above already include that - it is a win anyway.
+
+## 8. BIGGEST DEPLOYED WIN: SYCL graph is HARMFUL at -c 131072 (2026-07-16)
+
+**The deployed server ran `GGML_SYCL_DISABLE_GRAPH=0` (graph ON) the whole time - and at
+`-c 131072` that is a 2.8x TG REGRESSION, not "neutral" as previously believed.**
+
+Measured, same image/config/context, only the graph env differs:
+
+| config | TG |
+| --- | ---: |
+| graph ON (`GGML_SYCL_DISABLE_GRAPH=0`) | **15.1-16.6 t/s** |
+| graph OFF (default) | **42.0-42.4 t/s** |
+
+Consistent across repeats (graph-on 15.5/15.2/15.1; graph-off 42.4/42.2/42.0), VRAM was not the
+issue (32 GB free at load). This is the "25.6 t/s deployed vs 42 t/s bench" gap from the very first
+investigation - it was NEVER a bench artifact, it was graph-on tanking the deployed server. Every
+isolated llama-bench hit 42 because llama-bench defaults `GGML_SYCL_DISABLE_GRAPH=1` (off).
+
+**The old memory/notes claim "SYCL graph ENABLED ... neutral, confirmed 2026-07-16" was WRONG** -
+that test measured the wrong thing or the wrong regime. At the production 128k context on this
+hybrid recurrent model, graph ON is a hard 2.8x TG loss.
+
+**Deploy fix: run graph OFF (omit `GGML_SYCL_DISABLE_GRAPH=0` and `SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC=1`).**
+Deployed 2026-07-16 as `llama-cpp-bonsai:meat4-dspark`, graph off, `-c 131072 -b 2048 -ub 2048`,
+no dspark (dspark is net-negative at 131072, see below). Real deployed TG now 42 t/s, up from ~15.
+
+### dspark deploy note
+
+dspark works (markov fixed) but is net-negative at `-c 131072`: the drafter stages the full context
+capacity per round (`n_batch -> 131076`, "full-context staging"), ~64 ms/token. dspark is a clear
+win only at moderate context (`-c 8192`: code +62%). So it is NOT enabled in the 128k deploy; the
+fix binary is in the image (`:meat4-dspark`) for smaller-context use.
