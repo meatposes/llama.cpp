@@ -886,3 +886,37 @@ Correctness + feasibility + peak are all proven; the open question is purely whe
 reaches competitive efficiency. That is the next concrete step: engineer the amortized kernel
 (weights expanded once per N-tile, reused across M; minimal barriers; larger tiles) and measure its
 TOPS. If it clears ~150 TOPS it wins; if it stalls at tens of TOPS, stop.
+
+### GO/NO-GO RESULT: NO-GO for this kernel design (2026-07-16)
+
+Engineered the amortized kernel through five rounds, measuring TOPS at each:
+
+| version | TOPS | note |
+| --- | ---: | --- |
+| naive tiled | 1.7 | weight re-expanded per m-tile |
+| amortized (expand once/N-tile, A from global) | 5.0 | `q2_tiled_amortized.cpp` |
+| + scale loads hoisted to SLM | 6.5 | |
+| + in-register coord scaling (get_coord) | **11.3** | `q2_tiled_inreg_scale.cpp`, MSTRIP=4 |
+| MSTRIP 8 / 16 | 3.9 / 4.8 | register spill - persistent float accumulators cap MSTRIP at 4 |
+
+**Plateau at ~11.3 TOPS = ~3% of the 358 int8 peak.** The gate was ">=150 TOPS wins, tens = stop."
+This is a stop.
+
+Why it stalls: each M8xN16xK32 DPAS is surrounded by weight expansion + a barrier + an activation
+load + per-32-K scale application. Q8_1's per-32 scaling forces the int32->float scale every
+sub-block, which breaks the XMX pipeline; the tiny tile means overhead dominates; and the
+persistent float accumulators needed to amortize the weight expansion cap the tile at MSTRIP=4
+before register spill. All correct (maxrel 0 every version), just slow.
+
+Comparison: this one ffn_up GEMM (91 GFLOP) takes 8 ms here; oneDNN's F16 GEMM at even 50% of its
+183 TOPS peak does it in ~1 ms - **~8x faster, even carrying its dequant overhead**. So the fused
+int8 kernel loses the GEMM despite skipping dequant. The ~1.6x ceiling is real but unreachable with
+this straightforward design.
+
+**Recommendation: NO-GO.** Reaching competitive XMX utilization would need expert-level GEMM
+engineering (large register tiles without the per-sub-block scale stall - likely accumulating int32
+across a full 128-K block and restructuring the scale, or a different activation quantization than
+Q8_1's per-32), and even then success is uncertain against oneDNN's years of tuning. The proven
+probes and this measured plateau are the value: they close the question cheaply instead of after a
+multi-week kernel effort. **Item 1 is done - answered NO-GO, not abandoned.** Correctness,
+feasibility, peak, and the practical ceiling are all measured and recorded.
