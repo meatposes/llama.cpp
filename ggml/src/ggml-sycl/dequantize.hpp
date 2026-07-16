@@ -757,27 +757,25 @@ static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * 
 template<typename dst_t>
 static void dequantize_block_q2_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                   const sycl::nd_item<3> &item_ct1) {
-    const int64_t i      = item_ct1.get_group(2);
-    const int64_t tid    = item_ct1.get_local_id(2);
-    const int lane_ib    = i * WARP_SIZE + tid;
-    const int64_t nblocks = k / QK2_0;
+    // One element per work-item so that adjacent lanes write adjacent addresses. Assigning a
+    // whole block per lane instead makes each lane write QK2_0 elements apart, which puts every
+    // store in a sub-group on a separate cache line.
+    const int64_t e = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
 
-    if (lane_ib >= nblocks) {
+    if (e >= k) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK2_0;
+    const int64_t nblocks = k / QK2_0;
+    const int64_t ib      = e / QK2_0;
+    const int     l       = e % QK2_0;
 
     // Q2_0 SoA: qs region is [nblocks * 32] bytes, d region follows
-    const uint8_t  * qs    = (const uint8_t *)vx + lane_ib * (QK2_0 / 4);
-    const sycl::half * s_ptr = (const sycl::half *)((const uint8_t *)vx + nblocks * (QK2_0 / 4)) + lane_ib;
+    const uint8_t    * qs    = (const uint8_t *) vx + ib * (QK2_0 / 4);
+    const sycl::half * s_ptr = (const sycl::half *) ((const uint8_t *) vx + nblocks * (QK2_0 / 4)) + ib;
 
-    const float d = float(*s_ptr);
-
-    for (int l = 0; l < QK2_0; ++l) {
-        const int raw = (qs[l / 4] >> ((l % 4) * 2)) & 0x03;
-        y_ptr[l]      = d * (raw - 1);
-    }
+    const int raw = (qs[l / 4] >> ((l % 4) * 2)) & 0x03;
+    yy[e]         = float(*s_ptr) * (raw - 1);
 }
 
 template<typename dst_t>
