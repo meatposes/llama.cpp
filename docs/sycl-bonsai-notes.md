@@ -73,6 +73,7 @@ Committed on `sycl/bonsai-q2_0-perf`:
 | `sycl: raise MMVQ_MAX_BATCH_SIZE from 8 to 32` | validated 2026-07-16: ~2x at batch 16-32 |
 | `sycl: make the MMVQ batch cap runtime-tunable` | `GGML_SYCL_MMVQ_MAX_BATCH` |
 | `sycl: embed SPIR-V fallback alongside AOT` | `spir64_gen,spir64` + multi-device |
+| `sycl: fix work-group size in non-contiguous concat` | **+7% prefill**; generic backend fix |
 
 ### Build
 
@@ -126,6 +127,33 @@ native to the prism fork, not something we added.
 the contiguous path, which blocks SYCL graph recording. The queue is created with
 `sycl::property::queue::in_order` (`dpct/helper.hpp:748, 787`), so ordering was already
 guaranteed and the waits were redundant. Not a hack; upstreamable.
+
+**Non-contiguous concat work-group size (+7% prefill).** Found via the profile (section 4), which
+put `concat` at 9.0% of prefill. The non-contiguous kernel was launched with local range
+**(1,1,1)** - one work-item per work-group, each serially walking all `ne0` elements - while the
+kernel body was already written for a multi-item group:
+
+    for (int i0 = item_ct1.get_local_id(2); i0 < ne0; i0 += item_ct1.get_local_range(2))
+
+That stride loop had been running with a stride of 1. CUDA launches the same kernel with
+`CUDA_CONCAT_BLOCK_SIZE` (256) threads/block (`ggml/src/ggml-cuda/concat.cu:178`); the SYCL port
+dropped it. Fix: launch `SYCL_CONCAT_BLOCK_SIZE` work-items per group, body unchanged.
+
+| test | before (local=1) | after (local=256) | |
+| --- | ---: | ---: | ---: |
+| pp512 | 857.65 +/- 0.86 | **916.83 +/- 3.03** | **+6.9%** |
+| pp2048 | 814.70 +/- 0.70 | **875.19 +/- 2.37** | **+7.4%** |
+| tg128 | 41.95 +/- 0.08 | 41.97 +/- 0.10 | unchanged |
+
+TG is unaffected: at `n_tokens=1` the transposed operand still satisfies `ggml_is_contiguous`
+(`ne[0]==1` short-circuits the check), so TG always took the contiguous path. PP diverges because
+`ggml_transpose` on `qkv_mixed` is non-contiguous once `n_tokens > 1`
+(`src/models/delta-net-base.cpp:473`, delta-net prepending conv state).
+
+**Generic backend fix, not model-specific** - it affects every CONCAT with a non-contiguous
+operand on SYCL (deepseek2, mamba, kimi-linear, rwkv6qwen2, ...). Good upstream candidate for
+ggml-org. `test-backend-ops -o CONCAT -b SYCL0` passes, including the v=2/v=3 non-contiguous
+variants.
 
 ### Did not work
 
@@ -384,9 +412,8 @@ P3 - reprioritized by the profile (2026-07-16):
     `SYCL_USE_XMX` is "not used for XMX really" - it is only a dispatch gate. This is greenfield
     and a large job, but it is where the prefill time actually is.
 
-11. **`concat` is 9.0% of prefill** (0.102 s, 96 instances = 48 delta-net layers x 2). Suspiciously
-    expensive for a memcpy-shaped op, and we already touched this file. Cheap to investigate,
-    possibly cheap to fix. Best effort/reward ratio on this list.
+11. ~~**`concat` is 9.0% of prefill.**~~ **DONE - fixed, +7% prefill.** Was a launch-config bug:
+    local range (1,1,1) instead of 256. See section 3. Upstream candidate.
 
 12. **Chunked gated-delta-net: DEPRIORITIZED.** Worth <= 9.6% of PP and ~2% of TG. The earlier
     claim that this was the "highest ceiling" item was wrong - it was based on layer count
