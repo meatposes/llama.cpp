@@ -685,6 +685,7 @@ P3 - reprioritized by the profile (2026-07-16):
 
 11. ~~**`concat` is 9.0% of prefill.**~~ **DONE - fixed, +7% prefill.** Was a launch-config bug:
     local range (1,1,1) instead of 256. See section 3. Upstream candidate.
+    **Re-profiled 2026-07-16: concat is now <1% (below 0.014s), off the top-10. Fully closed.**
 
 12. **Chunked gated-delta-net: DEPRIORITIZED.** Worth <= 9.6% of PP and ~2% of TG. The earlier
     claim that this was the "highest ceiling" item was wrong - it was based on layer count
@@ -699,6 +700,9 @@ P3 - reprioritized by the profile (2026-07-16):
 
 14. **MMVQ efficiency for TG.** ~68% of the measured 460 GB/s ceiling; a perfect kernel reaches
     ~62 t/s vs 42 today. Real but a grind, and 68% is already respectable for a quantized GEMV.
+    **Checked 2026-07-16: `GGML_SYCL_MMV_Y=1` is already optimal (2->41.8, 4->41.0 t/s). No cheap
+    win; the 2-bit->byte dp4a expansion is inherent ALU overhead, so real gains need a different
+    kernel (overlaps the XMX GEMM, item 10/deferred).**
 
 15. Do **not** restart dp4a MMQ. If any GEMM work happens, it is item 10 (XMX), not dp4a. If
     someone does revisit dp4a anyway, fix `VDR_Q2_0_Q8_1_MMQ` to 4 first.
