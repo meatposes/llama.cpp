@@ -35,9 +35,10 @@ Check it yourself: `blk.0` carries `ssm_a`, `ssm_alpha/beta.weight`, `ssm_conv1d
 `ssm_dt.bias`, `ssm_norm.weight`, `ssm_out.weight`. `blk.3` carries `attn_q/k/v/output` and
 `attn_q_norm/k_norm`. That is the hybrid split, visible directly in the tensor names.
 
-**Why it matters:** every optimization so far (Q2_0 MMVQ, SoA reorder, the abandoned MMQ,
-oneDNN F16, AOT) targets `MUL_MAT`. Nothing has touched the `GGML_OP_GATED_DELTA_NET` path,
-which runs in **48 of 64 layers**. Profile before assuming `mmq.cpp` is where the time goes.
+**Why it matters:** it explains the shape of the model, but do **not** conclude from "48 of 64
+layers" that delta-net is where the time goes. It is not - profiling (section 4) measured it at
+~9.6% of prefill and ~2% of TG. They are cheap layers. Prefill time is dominated by MUL_MAT and,
+above all, by **dequantizing Q2_0 weights to F16 to feed oneDNN** (23.7% of PP on its own).
 
 ### Q2_0 format
 
@@ -260,19 +261,73 @@ Follow-ups this opens:
 Caveat: `llama-cpp-sycl` (spans `level_zero:0;1`) was resident but idle during these runs, so it
 held VRAM on the device. It affected both arms equally.
 
-### Where does the time actually go?
+### Where does the time actually go? - ANSWERED 2026-07-16
 
-Unknown, and it gates everything else. The delta-net path (48/64 layers) has never been
-profiled. Prior VTune runs predate the F16/reorder work and only ever showed
-`sgemm_nocopy_tn_32x16_4x8`, i.e. the old dequant+BLAS path.
+Profiled with `vtune -collect xpu-offload` (note: `gpu-offload` is deprecated in VTune 2026.3).
+`dev.i915.perf_stream_paranoid` was already 0. Host VTune:
+`/opt/intel/oneapi/vtune/latest/bin64/vtune`.
 
-- Host VTune: `/opt/intel/oneapi/vtune/latest/bin64/vtune`
-- GPU PMU needs `sudo sysctl dev.i915.perf_stream_paranoid=0`
-- Without the kernel module, XVE utilization reads 0% but kernel timing is still accurate
+**The delta-net is NOT the bottleneck. It was the wrong target.** Prior sessions (and the first
+draft of these notes) assumed 48/64 layers meant delta-net dominated. It does not - they are
+cheap layers.
 
-Roofline: TG 42 t/s x 6.7 GiB = ~281 GB/s achieved. Confirm the B70's spec bandwidth. If peak is
-~450 GB/s we are at ~62% and TG headroom is real; if the delta-net scans dominate, TG is
-latency-bound and no amount of `MUL_MAT` work will help.
+#### PP512 (820 t/s under VTune vs 861 native, so overhead is low and shares are trustworthy)
+
+Excluding the one-time load memcpy, compute totals ~1.13 s:
+
+| Task | Time (s) | Share |
+| --- | ---: | ---: |
+| DNNL `gemm_kernel` | 0.368 | **32.6%** |
+| **`dequantize_block_sycl<128,1,...>`** | **0.267** | **23.7%** |
+| `gated_delta_net` | 0.108 | 9.6% |
+| `concat` | 0.102 | 9.0% |
+| `convert_unary_nc` | 0.065 | 5.8% |
+| `flash_attn_tile` | 0.058 | 5.1% |
+| `ssm_conv` | 0.038 | 3.4% |
+| `swiglu` | 0.027 | 2.4% |
+
+**Dequantization costs 73% as much as the matmul it feeds; together 56% of prefill.**
+
+The dequant+DNNL path expands all 26.9B params to F16 on *every ubatch*: ~54 GB written and
+re-read, vs 7.15 GB if the weights were consumed quantized. That is ~115 GB of traffic per
+512-token prefill; at the measured 460 GB/s ceiling that is a ~250 ms floor, and pp512 takes
+~624 ms. Prefill sits at roughly 19% of XMX peak - **it is not compute-bound, it is
+bandwidth-bound on dequantizing its own weights.**
+
+#### TG128 (19 t/s under VTune vs 42 native - heavy overhead, read as shares only)
+
+| Task | Time (s) | Note |
+| --- | ---: | --- |
+| `reorder_mul_mat_vec_q2_0` (8 entries) | ~2.05 | dominant |
+| `zeCommandListAppendMemoryCopy` | 1.058 | mostly one-time load, see below |
+| `get_rows_sycl_float` | 0.127 | |
+| `flash_attn_tile` | 0.066 | ~3% |
+| `gated_delta_net` | 0.045 | **~2%** |
+
+TG is MMVQ-bound, i.e. weight-read bound. Expected for memory-bound decode.
+
+#### The memcpy line is benign - do not chase it
+
+`zeCommandListAppendMemoryCopy` reports 33.2 GB "Host-to-Device" on a 6.7 GiB model, which looks
+alarming. It is not. Scaling `-n` 8/64/128 fits exactly:
+
+- instances = 1403 fixed + **56 per token** (56 ~= 48 delta-net layers + 8)
+- bytes = 13.77 GB fixed + **152 MB per token**
+- time = 1.019 / 1.036 / 1.058 s - **nearly flat**
+
+The flat time is the tell: +18 GB in +0.039 s = **~460 GB/s**, i.e. device-local VRAM bandwidth,
+not PCIe. VTune labels it H2D because the source is a host-USM pointer, but the data is
+device-resident. The 152 MB/token is the recurrent state (48 x 3.1 MB = 149 MB, matching the
+149.626 MiB checkpoint). At 460 GB/s that is 0.33 ms against a 24 ms/token budget: ~1.4%.
+The 13.77 GB fixed baseline is model load + reorder round-trips.
+
+#### Measured bandwidth ceiling (useful byproduct)
+
+That memcpy rate gives B70's real achievable bandwidth: **~460 GB/s**.
+
+TG reads ~7.15 GB weights + ~0.3 GB state per token. At 42 t/s that is **~313 GB/s = ~68% of
+ceiling**. Headroom ~1.47x, i.e. a perfect MMVQ would reach ~62 t/s. 68% is already decent for a
+quantized GEMV, so this is a grind, not a windfall.
 
 ### Context checkpoints
 
@@ -309,23 +364,46 @@ P1 - cheap, resolves open questions:
 
 P2 - profile:
 
-8. VTune the current build. Per-kernel split of TG and PP across delta-net vs FA vs MUL_MAT.
+8. ~~VTune the current build.~~ **DONE** - see section 4. It invalidated much of the old P3 list.
 9. Check the output head: Q2_0 `[5120 x 248320]`, ~318 MB, a 248320-row GEMV every token.
 
-P3 - real engineering, only if P2 justifies it:
+P3 - reprioritized by the profile (2026-07-16):
 
-10. Chunked gated-delta-net kernel for prefill. Both backends scan tokens sequentially
-    (`ggml/src/ggml-sycl/gated_delta_net.cpp:70`, `ggml/src/ggml-cuda/gated_delta_net.cu:63`),
-    and the CUDA file carries the TODO explicitly:
-    `//TODO: Add chunked kernel for even faster pre-fill` (`gated_delta_net.cu:183`).
-    So there is **nothing better to port from CUDA** - SYCL is at parity. Highest ceiling in this
-    document, backend-agnostic; doing it in CUDA first would be upstreamable and easier to validate.
-11. XMX flash attention. `ggml/src/ggml-sycl/fattn.cpp:192` says `// Todo: Use the XMX kernel if
-    possible:` - attention currently runs on generic SIMD tile/vec kernels while GEMMs get XMX via
-    oneDNN. With `head_dim=256` this is expensive and likely explains the 861 -> 528 t/s falloff
-    with depth. Large job.
-12. Do **not** restart MMQ unless P2 shows `MUL_MAT` is the bottleneck *and* you intend to use
-    `joint_matrix`/XMX rather than dp4a. If you do, fix `VDR_Q2_0_Q8_1_MMQ` to 4 first.
+10. **Native Q2_0 XMX GEMM for prefill - the biggest lever by a wide margin.** Dequantization is
+    23.7% of prefill on its own, and the dequant+DNNL path moves ~115 GB per 512-token prefill
+    versus ~7.15 GB if weights were consumed quantized. A `joint_matrix`/XMX Q2_0 GEMM that
+    dequantizes **in-register** and feeds XMX directly would delete ~54 GB of traffic per ubatch.
+    Prefill is at ~19% of XMX peak because it is bandwidth-bound on its own dequant, so the
+    ceiling here is large.
+
+    This is *not* a repeat of the failed MMQ attempt. That kernel was **dp4a**, which cannot beat
+    XMX; the 153 vs 861 t/s result stands and is not evidence against this. It is the same
+    mechanism that makes MMVQ beat oneDNN 2x at batch <= 32: skipping the dequant entirely.
+    Note there is currently **no `joint_matrix` use anywhere in the SYCL backend**
+    (`grep joint_matrix ggml/src/ggml-sycl/` is empty), and `common.hpp:105` admits
+    `SYCL_USE_XMX` is "not used for XMX really" - it is only a dispatch gate. This is greenfield
+    and a large job, but it is where the prefill time actually is.
+
+11. **`concat` is 9.0% of prefill** (0.102 s, 96 instances = 48 delta-net layers x 2). Suspiciously
+    expensive for a memcpy-shaped op, and we already touched this file. Cheap to investigate,
+    possibly cheap to fix. Best effort/reward ratio on this list.
+
+12. **Chunked gated-delta-net: DEPRIORITIZED.** Worth <= 9.6% of PP and ~2% of TG. The earlier
+    claim that this was the "highest ceiling" item was wrong - it was based on layer count
+    (48 of 64) without measurement. They are cheap layers. The CUDA TODO
+    (`gated_delta_net.cu:183`) still stands and is still unimplemented in both backends, but the
+    payoff is bounded at ~10% of prefill.
+
+13. **XMX flash attention: DEPRIORITIZED.** `flash_attn_tile` is 5.1% of PP and ~3% of TG, so the
+    `fattn.cpp:192` TODO caps out around 5%. Not worth the large job. (It would, separately, be
+    the enabler for quantized KV - see section 3 - but that is a memory-capacity argument, not a
+    speed one.)
+
+14. **MMVQ efficiency for TG.** ~68% of the measured 460 GB/s ceiling; a perfect kernel reaches
+    ~62 t/s vs 42 today. Real but a grind, and 68% is already respectable for a quantized GEMV.
+
+15. Do **not** restart dp4a MMQ. If any GEMM work happens, it is item 10 (XMX), not dp4a. If
+    someone does revisit dp4a anyway, fix `VDR_Q2_0_Q8_1_MMQ` to 4 first.
 
 ---
 
