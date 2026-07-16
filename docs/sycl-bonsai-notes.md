@@ -176,7 +176,11 @@ MMVQ or an XMX Q2_0 GEMM should therefore transfer to B50 proportionally.
 **contradicts the earlier arithmetic** in section 1 that called `-c 131072` "marginal to OOM".
 Caveat: the server logs `common_init_result: fitting params to device memory ...`, so `-fit on`
 may be silently reducing the context - the effective `n_ctx` after fitting was not captured.
-**Open: confirm actual n_ctx at `-c 131072` on B50 before trusting full context there.**
+**RESOLVED 2026-07-16: B50 serves the full `n_ctx = 131072`, not reduced.** `-fit` prints its
+message but leaves context intact - it fits because `n_parallel=4` with `kv_unified=true` shares
+one ~8 GB KV cache across all 4 slots (not 8 GB x 4): 6.7 weights + 8 KV ~= 14.7 GB in 16.2 GB.
+All 4 slots report `n_ctx = 131072`. Load took ~43s on the slower Xeon host (fit search + reorder).
+(Note: only `prism-concatfix` is on screamer; `prism-dequantfix`/`:meat3` was not re-transferred.)
 
 **Operational warning:** llama-server startup at large `-c` on B50 (KV alloc + `-fit` search +
 warmup + Q2_0 SoA reorder) pegs the GPU for a sustained period and makes the host sluggish. Run
@@ -620,7 +624,9 @@ P1 - cheap, resolves open questions:
 P2 - profile:
 
 8. ~~VTune the current build.~~ **DONE** - see section 4. It invalidated much of the old P3 list.
-9. Check the output head: Q2_0 `[5120 x 248320]`, ~318 MB, a 248320-row GEMV every token.
+9. ~~Check the output head.~~ **DONE - no win.** In the TG profile it is 0.079s (~4% of MMVQ
+   time), proportionate to its 4.7% share of weight bytes, and already on the MMVQ reorder fast
+   path. Not a hotspot.
 
 P3 - reprioritized by the profile (2026-07-16):
 
