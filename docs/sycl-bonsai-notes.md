@@ -967,6 +967,19 @@ Unlike the XMX GEMM (item 1), this does NOT need to compete with a tuned library
 be fast enough to stop being the bottleneck (~1 ms), which a straightforward memory-bound GEMV
 kernel easily achieves. Expected result: dspark flips from -60% toward the CUDA-side +34%.
 
+**FIX PROVEN STANDALONE 2026-07-16 (`docs/dspark-markov-sycl/markov_sycl_probe.cpp`).** Wrote the
+SYCL resample (two-stage: per-work-group partial GEMV+argmax over vocab stripes, then final reduce,
+`prev` chained on device). Correct - chained argmax matches the CPU reference exactly - and
+**1.87 ms/round vs 113 ms host (60x)**, comfortably under the 24 ms decode step. Needed an in-order
+queue for the `prev` chain (out-of-order raced the dPrev write/read; the ggml SYCL backend queue is
+already in-order, so this is free in integration). The Markov head is no longer the bottleneck.
+
+Remaining: integration - implement `dspark_markov_sycl_init/resample/free` matching the CUDA
+interface in `common/dspark-markov.h`, add a `LLAMA_DSPARK_MARKOV_SYCL` path in `speculative.cpp`
+parallel to the CUDA one, wire CMake, rebuild the SYCL image, deploy, and measure dspark end-to-end
+(expect it to flip from -60% toward positive). Device memory for the two f32 factors is ~508 MB,
+fits the B70 alongside model+KV+drafter.
+
 Note the confidence head (`dspark.confidence_head`) and the drafter forward also run per round;
 those are small (5376x1) and on the normal SYCL path. The Markov GEMV is the sole 254 MB CPU
 outlier. Verify with a profile once the SYCL Markov path exists.
