@@ -111,8 +111,18 @@ in the build log.
     docker build -f Dockerfile.mmq-test -t llama-cpp-intel:prism-concatfix .
     docker tag llama-cpp-intel:prism-concatfix llama-cpp-bonsai:meat2
 
-Deployed 2026-07-16 as `llama-cpp-bonsai` on `llama-cpp-bonsai:meat2` (`06c007b37469`).
-Previous image `llama-cpp-bonsai:meat` (`6c00cd3a7690`) retained for rollback.
+**Currently deployed: `llama-cpp-bonsai:meat3` (`f0f0e7a9ab9d`)**, 2026-07-16, includes the concat
+and SoA dequant fixes. Cold start 2.93s. Rollback images retained: `:meat2` (`06c007b37469`,
+concat fix only) and `:meat` (`6c00cd3a7690`, neither).
+
+Server-path A/B on the real AOT images (`-ub 8,512`, i.e. reorder fired - see section 3b):
+
+| image | pp512 post-reorder |
+| --- | ---: |
+| `:meat2` (no dequant fix) | 663.37 +/- 1.60 |
+| **`:meat3` (deployed)** | **765.24 +/- 1.90** (**+15.4%**) |
+
+The JIT build predicted 768.58 vs 765.24 measured on AOT - again within ~0.5%.
 
 Verified on the deployed image, AOT vs AOT (**prefill-only numbers - the server's real prefill
 is ~28% lower because the SoA reorder fires; see section 3b**):
