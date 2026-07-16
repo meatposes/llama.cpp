@@ -76,6 +76,8 @@ Committed on `sycl/bonsai-q2_0-perf`:
 | `sycl: embed SPIR-V fallback alongside AOT` | `spir64_gen,spir64` + multi-device |
 | `sycl: fix work-group size in non-contiguous concat` | **+8% prefill**; generic backend fix |
 | `sycl: normalize GGML_SYCL_DEVICE_ARCH for ocloc` | `_`->`-`; unblocks multi-device AOT |
+| `sycl: coalesce writes in the Q2_0 SoA dequant kernel` | **+15% server prefill** (662 -> 763) |
+| `sycl: one qs byte per work-item in Q2_0 SoA dequant` | +0.7% more (-> 769) |
 
 ### Build
 
@@ -334,8 +336,9 @@ which triggers `opt_for_reorder()` - and from then on every prefill dequantizes 
 | MMVQ runs first so reorder fires, then prefill (**what the server does**) | **661.99 +/- 0.79** |
 | `llama-bench -p 512 -n 128` | 912.96 - misleading, it runs pp512 *before* tg128 |
 
-**So the deployed server's prefill is ~662 t/s, not 916.** This is a real part of the
-bench-vs-server gap noted in section 2.
+**So the deployed server's prefill was ~662 t/s, not 916.** This is a real part of the
+bench-vs-server gap noted in section 2. **Now ~769** after the dequant fix below; the deployed
+`:meat2` image predates that fix and still runs at ~662.
 
 Reproduce it without a server: `-ub 8,512` makes ub=8 take the MMVQ path (8 <= cap), firing the
 reorder, and the following ub=512 then measures the post-reorder prefill.
@@ -351,12 +354,46 @@ reorder, and the following ub=512 then measures the post-reorder prefill.
 TG gains **2.7x** from the reorder; prefill loses 28%. Keep it enabled. But this makes the SoA
 dequant kernel a concrete, well-scoped target:
 
-**TOP KERNEL TARGET: make `dequantize_block_q2_0_reorder` (SoA) as fast as the AoS path.**
-Worth **+39% prefill on the real server path** (662 -> ~916) with TG untouched. Bigger than the
-concat win, and unlike the XMX GEMM it is a bounded optimization of an existing kernel rather
-than greenfield. See `ggml/src/ggml-sycl/dequantize.hpp` and `convert.cpp` (the fp16/fp32
-dispatch picks `dequantize_row_q2_0_sycl_reorder` vs the AoS fallback on
-`extra->optimized_feature.reorder`).
+### Partly fixed 2026-07-16: +16% on the server prefill path
+
+`dequantize_block_q2_0_reorder` gave each work-item a whole QK2_0 block and looped 128 elements
+serially, so adjacent lanes wrote addresses 128 elements apart - every store in a sub-group on its
+own cache line. The AoS path uses the usual one-element-per-lane pattern, which is why it was
+faster despite the worse layout.
+
+Rewrote it as one qs byte (4 elements) per work-item, adjacent lanes on adjacent bytes:
+
+| variant | pp512 post-reorder |
+| --- | ---: |
+| original (1 block/lane, serial 128-loop) | 661.99 +/- 0.79 |
+| 1 element/lane (coalesced) | 763.27 +/- 2.50 |
+| **1 qs byte/lane (current)** | **768.58 +/- 1.07** (**+16.1%**) |
+| AoS ceiling (reorder not fired) | 916 |
+
+tg128 unchanged (42.23). The jump is all from coalescing; going 1 -> 4 elements per lane added
+only +0.7%, so load count was not the issue.
+
+Correctness: verified by generating through the post-reorder prefill path (a 40x repeated long
+prompt answers correctly; short factual prompts correct). **`test-backend-ops` does not cover this
+kernel** - it never sets the reorder flag, so it only ever exercises the AoS path. The
+`q2_K`/`q4_K` GET_ROWS failures on this branch are pre-existing tolerance noise (~2.6e-7 vs 1e-7),
+unrelated; all `q2_0` cases pass.
+
+**Still open - ~16% left (768 vs 916).** Profiling the post-reorder path shows the whole remaining
+gap is still in this kernel; everything else matches the AoS profile:
+
+| task | SoA (now) | AoS |
+| --- | ---: | ---: |
+| dequant | **0.494 s** | **0.267 s** |
+| DNNL gemm | 0.375 s | 0.368 s |
+
+Untested hypothesis: SoA splits the read into **two distant streams** - `qs` at offset 0 and the
+scales at offset `k/4` - whereas AoS keeps `d` and `qs` together in one 34-byte `block_q2_0`, so
+one stream and often one cache line. Worth trying: stage the scale through SLM per work-group, or
+have a work-group cover one block and load `d` once. If that is the cause, a layout change (e.g.
+interleaving scales per 32-byte run rather than a fully separate region) may be the real fix - but
+note the SoA layout exists to serve MMVQ, which is worth 2.7x on TG, so any layout change must
+keep MMVQ fast.
 
 Note this also means the section 4 profile *understated* dequant: it profiled pp512 alone, i.e.
 the fast AoS kernel, at 23.7% of prefill. On the server path dequant is a larger share still.
