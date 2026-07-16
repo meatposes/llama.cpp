@@ -408,6 +408,41 @@ keep MMVQ fast.
 Note this also means the section 4 profile *understated* dequant: it profiled pp512 alone, i.e.
 the fast AoS kernel, at 23.7% of prefill. On the server path dequant is a larger share still.
 
+## 3c. RAISE n_ubatch - +35% prefill, no code, no downside (found 2026-07-16)
+
+`n_ubatch` defaults to **512** and nobody had ever swept it. It is worth ~35-39% of prefill on
+long prompts.
+
+**Why:** dequantization cost is **per ubatch** - each ubatch dequantizes all 26.9B weights to F16
+(section 3b/4). A 2048-token prompt at `-ub 512` therefore dequantizes the entire model **four
+times**; at `-ub 2048`, once. Larger ubatch amortizes the dominant cost of the prefill path.
+
+All measured on the server path (reorder fired via a leading `-ub 8`), B70, neighbour
+interference checked = 0:
+
+| n_ubatch | pp2048 | pp4096 |
+| ---: | ---: | ---: |
+| 8 | 169.40 | 167.87 |
+| 256 | 521.42 | - |
+| **512 (default)** | **734.56** | **686.55** |
+| 1024 | 911.87 | - |
+| **2048** | **1019.44** (+39%) | **926.90** (+35%) |
+| 4096 | - | **956.90** (+39%) |
+
+**No downside on short prompts:** pp512 measures 769.36 at `-ub 512` vs 767.38 at `-ub 2048` -
+identical, because the ubatch is naturally capped by the actual prompt length. So a large `-ub`
+only ever helps.
+
+VRAM: both `-b 512 -ub 512` and `-b 2048 -ub 2048` start fine at `-c 131072` on B70.
+
+**Deployed 2026-07-16** with `-b 2048 -ub 2048`. Real server log: an 819-token prompt evaluates at
+**714.55 t/s**.
+
+Caveat not yet measured: with `n_parallel = 4`, a larger ubatch is a coarser scheduling unit, so
+concurrent-user latency fairness may suffer even though throughput improves. If interactive
+latency regresses under concurrent load, drop back to `-ub 1024` (still +24% on pp2048) or the
+512 default. Worth a multi-user latency test.
+
 ## 4. Open questions
 
 ### The dspark contradiction (highest value)
@@ -577,8 +612,8 @@ P1 - cheap, resolves open questions:
 
 4. ~~A/B `GGML_SYCL_MMVQ_MAX_BATCH` 8 vs 32.~~ DONE - 32 wins ~2x at batch 16-32. Next: find the
    real MMVQ/oneDNN crossover above 32 (needs `*_switch_ncols` instantiated past 32).
-5. Sweep `-ub` / `-b`. `n_ubatch=512` is an untouched default and 48 sequential-scan layers make
-   512 non-obvious.
+5. ~~Sweep `-ub` / `-b`.~~ **DONE - `-ub 2048` is worth +35-39% prefill, deployed. See section 3c.**
+   Remaining: measure concurrent-user latency fairness at large ubatch with `n_parallel=4`.
 6. Get a B50 baseline on the dual-arch build.
 7. Establish the bandwidth ceiling. **This decides whether P2/P3 are worth doing at all.**
 
