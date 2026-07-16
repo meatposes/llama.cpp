@@ -997,3 +997,26 @@ instead of 113 ms) and dspark to flip from -60% toward the CUDA-side +34%.
 Note the confidence head (`dspark.confidence_head`) and the drafter forward also run per round;
 those are small (5376x1) and on the normal SYCL path. The Markov GEMV is the sole 254 MB CPU
 outlier. Verify with a profile once the SYCL Markov path exists.
+
+### dspark fix RESULT: markov bottleneck eliminated, dspark now neutral (not yet positive)
+
+Rebuilt llama-server with the Q4_1 fix and tested end-to-end (drafter Q4_1, block_size=4, capture on
+5 layers):
+
+- **TG 17 -> 38.3 t/s (+125%)**, no host-fallback warning in the log -> the Markov head now runs on
+  the SYCL GPU, not the 113 ms host path. **The specific bug is fixed.**
+- But dspark 38.3 < 42 no-spec, i.e. still ~neutral-to-slightly-negative, because **draft acceptance
+  measured only 0.27** (103/378), not the 84.9% the old notes claimed. At 27% acceptance most
+  draft+verify work is wasted, and on a single GPU draft and verify serialize.
+
+So the -60% catastrophe (Markov on CPU) is resolved; the remaining gap to the CUDA-side +34% is
+acceptance rate + draft/verify serialization - separate issues this fix does not touch, and exactly
+what the original memory note flagged ("SYCL serializes draft+verify on same device; needs a
+separate GPU to help"). dspark is now a marginal/close call rather than an obvious disable.
+
+Open (separate from the markov fix):
+- Why is acceptance 0.27 here vs the claimed 0.85? Prompt-dependent, or the FP-order difference in
+  the GPU argmax vs host changing drafts, or the 0.85 was a different config. Needs a controlled
+  acceptance measurement before enabling dspark in production.
+- Single-GPU draft+verify serialization caps the win regardless; a second GPU for the drafter (the
+  box has 2x B70) would let them overlap.
