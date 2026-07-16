@@ -245,6 +245,17 @@ Consequences:
 - Making quantized KV viable needs a GQA-aware quantized TILE (or XMX) kernel, not a dispatch
   tweak. Same bucket as the `fattn.cpp:192` XMX TODO.
 
+**Audit for more `local=(1,1,1)` launches (2026-07-16): nothing else to fix.** After the concat
+win, swept the backend for the same pattern. `cpy.cpp` has 11 launches with local range 1
+(`ggml_cpy_f32_q8_0_sycl` and friends), but **CUDA does the same** - all 11 equivalents launch
+`<<<num_blocks, 1, 0, stream>>>` (`ggml/src/ggml-cuda/cpy.cu:252`). That is upstream parity, not
+a porting slip: those kernels are written for one work-item per quantization block, whereas
+concat's body had a `get_local_range(2)` stride loop that its launch never fed.
+
+Still theoretically suboptimal in *both* backends (1 work-item per group wastes the SIMD width),
+but it is off our path - the Q8_0 copies serve KV quantization, which we rejected - and changing
+it would diverge from upstream without a measurement to justify it.
+
 **dspark speculative decoding.** Measured 84.9% acceptance but TG 41 -> 17 t/s (-59%).
 **Do not trust the recorded root cause** - see open questions.
 
