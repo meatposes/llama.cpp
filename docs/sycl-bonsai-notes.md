@@ -112,7 +112,8 @@ in the build log.
 Deployed 2026-07-16 as `llama-cpp-bonsai` on `llama-cpp-bonsai:meat2` (`06c007b37469`).
 Previous image `llama-cpp-bonsai:meat` (`6c00cd3a7690`) retained for rollback.
 
-Verified on the deployed image, AOT vs AOT:
+Verified on the deployed image, AOT vs AOT (**prefill-only numbers - the server's real prefill
+is ~28% lower because the SoA reorder fires; see section 3b**):
 
 | test | `:meat` (old) | `:meat2` (new) | |
 | --- | ---: | ---: | ---: |
@@ -318,6 +319,48 @@ and context checkpoints - and logs **25.6 t/s** eval. Always state which harness
 
 ---
 
+## 3b. THE SoA REORDER PENALISES PREFILL BY 28% (found 2026-07-16)
+
+**Read this before trusting any pp number in this document, including our own.**
+
+`llama-bench -p 512` runs prefill *before* any decode, so the Q2_0 SoA reorder never fires and
+prefill uses the **AoS** dequant kernel. A real server always decodes first, which runs MMVQ,
+which triggers `opt_for_reorder()` - and from then on every prefill dequantizes from **SoA**
+(`dequantize_row_q2_0_sycl_reorder`), which is much slower.
+
+| scenario | pp512 |
+| --- | ---: |
+| prefill only, reorder never fires (what we have been measuring) | **916.23 +/- 4.59** |
+| MMVQ runs first so reorder fires, then prefill (**what the server does**) | **661.99 +/- 0.79** |
+| `llama-bench -p 512 -n 128` | 912.96 - misleading, it runs pp512 *before* tg128 |
+
+**So the deployed server's prefill is ~662 t/s, not 916.** This is a real part of the
+bench-vs-server gap noted in section 2.
+
+Reproduce it without a server: `-ub 8,512` makes ub=8 take the MMVQ path (8 <= cap), firing the
+reorder, and the following ub=512 then measures the post-reorder prefill.
+
+### The trade-off - the reorder is still correct, keep it on
+
+| | reorder ON (default) | reorder OFF (`GGML_SYCL_DISABLE_OPT=1`) |
+| --- | ---: | ---: |
+| tg128 | **42.26 +/- 0.13** | 15.71 +/- 0.03 |
+| pp512 (post-reorder) | 661.76 +/- 0.68 | **919.46 +/- 8.41** |
+| pp512 @ ub=8 (MMVQ) | 171.14 +/- 0.44 | 79.20 +/- 0.10 |
+
+TG gains **2.7x** from the reorder; prefill loses 28%. Keep it enabled. But this makes the SoA
+dequant kernel a concrete, well-scoped target:
+
+**TOP KERNEL TARGET: make `dequantize_block_q2_0_reorder` (SoA) as fast as the AoS path.**
+Worth **+39% prefill on the real server path** (662 -> ~916) with TG untouched. Bigger than the
+concat win, and unlike the XMX GEMM it is a bounded optimization of an existing kernel rather
+than greenfield. See `ggml/src/ggml-sycl/dequantize.hpp` and `convert.cpp` (the fp16/fp32
+dispatch picks `dequantize_row_q2_0_sycl_reorder` vs the AoS fallback on
+`extra->optimized_feature.reorder`).
+
+Note this also means the section 4 profile *understated* dequant: it profiled pp512 alone, i.e.
+the fast AoS kernel, at 23.7% of prefill. On the server path dequant is a larger share still.
+
 ## 4. Open questions
 
 ### The dspark contradiction (highest value)
@@ -367,11 +410,23 @@ decoding (batch ~= draft block size 4-5). Both sit in the 2x band.
 
 Follow-ups this opens:
 
-- **The crossover is well above 32.** MMVQ@32 = 204 vs oneDNN@32 = 98, and oneDNN does not reach
-  861 until ubatch 512. 32 is not an optimum - it is just where `*_switch_ncols` stops
-  instantiating. Extending to 64 (and raising `MMVQ_MAX_BATCH_SIZE_LIMIT`) may gain more, at the
-  cost of more kernel instantiations, build time and `.so` size. Worth bisecting where MMVQ and
-  oneDNN actually cross.
+- ~~**The crossover is well above 32.**~~ **MEASURED 2026-07-16: the crossover is ~32-64, so the
+  cap of 32 is already about right. Do not extend `switch_ncols`.** Clean numbers (3 reps, +/-0.03,
+  verified free of neighbour-container interference), all with the reorder fired:
+
+  | ubatch | MMVQ | oneDNN |
+  | ---: | ---: | ---: |
+  | 8 | 171.3 | (capped) |
+  | 16 | 192.6 | - |
+  | 32 | **207.3** | 98.9 |
+  | 64 | (not instantiated) | **137.8** |
+  | 128 | - | 261.8 |
+  | 256 | - | 701.3 |
+
+  MMVQ scales weakly (171 -> 193 -> 207), so an extrapolated MMVQ@64 ~= 215-220 vs oneDNN@64 = 138
+  - MMVQ would still win at 64, and even at 128 (261.8) it would be close. **Revisit:** extending
+  to 64 looks worth ~1.5x in the 33-64 band. It was deprioritized only because the band is
+  narrower than the 9-32 one and costs 32 more instantiations per type. Not a settled "no".
 - **ub=24 (168) is below ub=16 (190) and ub=32 (204).** Non-monotonic; likely a tail/occupancy
   effect on a non-power-of-2 ncols. Minor, but it means the MMVQ ncols kernels are not uniformly
   tuned.
