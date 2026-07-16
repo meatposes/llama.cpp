@@ -140,6 +140,41 @@ loop overhead. The conclusion is probably still right (dp4a cannot beat XMX), bu
 is weaker than it looks. `mmq.cpp` still has a Q2_0 case; it is dead code without
 `GGML_SYCL_FORCE_MMQ`.
 
+**KV cache quantization (`-ctk q8_0 -ctv q8_0`).** Measured 2026-07-16 on B70, `-fa 1`, `-r 2`.
+A large regression that worsens with depth. **Keep F16 KV.**
+
+| depth | f16 KV | q8_0 KV | delta |
+| ---: | ---: | ---: | ---: |
+| 0 | 42.54 +/- 0.24 | 40.33 +/- 0.18 | -5.2% |
+| 4096 | 39.02 +/- 0.05 | 31.56 +/- 1.87 | -19.1% |
+| 16384 | 32.27 +/- 0.04 | 21.90 +/- 0.02 | -32.1% |
+| 32768 | 25.97 +/- 0.01 | **15.21 +/- 0.01** | **-41.4%** |
+
+This is not a bandwidth effect: q8_0 reads *half* the KV bytes, so a bandwidth-bound attention
+would get faster. It is the FA kernel selection (`ggml_sycl_get_best_fattn_kernel`,
+`fattn.cpp:195-208`):
+
+- **F16 KV:** VEC is taken only `if (!gqa_opt_applies)`. With `gqa_ratio = 24/4 = 6`, a mask and
+  `max_bias == 0`, `gqa_opt_applies` is true, so TG falls through to **TILE** - which exploits GQA
+  and shares each KV read across 6 Q heads.
+- **Quantized KV:** returns **VEC** unconditionally at `Q->ne[1] <= 2`, ignoring
+  `gqa_opt_applies`, losing the GQA sharing. ~6x more KV work swamps the 2x saved by quantizing.
+
+**This is not a portable one-line fix.** The TILE kernel is F16-only - neither
+`ggml/src/ggml-sycl/fattn-tile.cpp` nor `ggml/src/ggml-cuda/fattn-tile.cu` contains any quantized
+type handling. Quantized KV *must* go to VEC. The asymmetry in the selection code is a
+consequence of that, not an oversight. Note CUDA does guard its F16 VEC path against this regime
+(`!(gqa_ratio > 4 && K->ne[1] >= 8192)`, `fattn.cu:460`), i.e. upstream knows VEC is bad for
+high-GQA long-context.
+
+Consequences:
+
+- **B50 (16 GiB): do not reach for KV quant to fit.** Prefer F16 KV at reduced context. F16 at
+  `-c 65536` is 4 GiB (6.7 + 4 + buffers, comfortable). F16 at `-c 131072` is 8 GiB (6.7 + 8 +
+  buffers ~= 15.7 GiB, marginal-to-OOM). q8_0 at 131072 fits but costs ~41% TG at depth.
+- Making quantized KV viable needs a GQA-aware quantized TILE (or XMX) kernel, not a dispatch
+  tweak. Same bucket as the `fattn.cpp:192` XMX TODO.
+
 **dspark speculative decoding.** Measured 84.9% acceptance but TG 41 -> 17 t/s (-59%).
 **Do not trust the recorded root cause** - see open questions.
 
@@ -256,8 +291,7 @@ Sweep against a realistic multi-turn workload and measure both throughput and TT
 
 P0 - free, no rebuild:
 
-1. `-ctk q8_0 -ctv q8_0`. KV 8 GiB -> 4 GiB, halves attention read bandwidth, and is the only way
-   B50 fits. Check output quality. Note it silently changes which FA kernel runs (see section 6).
+1. ~~`-ctk q8_0 -ctv q8_0`.~~ DONE - **rejected**, -41% TG at d=32768. Keep F16 KV. See section 3.
 2. Sweep `-cms` / `-ctxcp` against a multi-turn workload.
 3. Build a benchmark that mirrors the deployment (`-c`, `n_parallel`, graph, prompt cache) and
    re-baseline. The 861/42.1 numbers are not what production does.
