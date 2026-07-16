@@ -1009,14 +1009,21 @@ Rebuilt llama-server with the Q4_1 fix and tested end-to-end (drafter Q4_1, bloc
   measured only 0.27** (103/378), not the 84.9% the old notes claimed. At 27% acceptance most
   draft+verify work is wasted, and on a single GPU draft and verify serialize.
 
-So the -60% catastrophe (Markov on CPU) is resolved; the remaining gap to the CUDA-side +34% is
-acceptance rate + draft/verify serialization - separate issues this fix does not touch, and exactly
-what the original memory note flagged ("SYCL serializes draft+verify on same device; needs a
-separate GPU to help"). dspark is now a marginal/close call rather than an obvious disable.
+**Prompt-type sweep (2026-07-16, warm, 2 reps) - dspark is now net-positive, ENABLE it.** The
+0.27-acceptance prose prompt was the worst case; real workloads vary widely:
 
-Open (separate from the markov fix):
-- Why is acceptance 0.27 here vs the claimed 0.85? Prompt-dependent, or the FP-order difference in
-  the GPU argmax vs host changing drafts, or the 0.85 was a different config. Needs a controlled
-  acceptance measurement before enabling dspark in production.
-- Single-GPU draft+verify serialization caps the win regardless; a second GPU for the drafter (the
-  box has 2x B70) would let them overlap.
+| prompt | dspark (fixed) | vs ~42 no-spec | acceptance |
+| --- | ---: | ---: | ---: |
+| code | ~68 t/s | **+62%** | 0.69 |
+| factual | ~49 t/s | +17% | 0.42 |
+| chat/prose | ~41 t/s | neutral | 0.30 |
+
+Textbook speculative-decode profile: large win on structured/code content, modest on factual,
+harmless on prose. No host fallback in any run. (n_max is NOT tunable - it must equal the drafter's
+block_size=4; `--spec-draft-n-max 2` fails at load. So there is no n_max sweep, only prompt type.)
+The earlier single chat=2.8 t/s reading was a one-off glitch; warm it is 40.8/42.1.
+
+**Verdict: the markov fix turns dspark from -60% (broken) into a net win on realistic workloads.
+Enable it in the bonsai container.** The old "0.85 acceptance" claim was likely an even-more-
+structured workload; the real range is 0.30-0.69, still a clear win where it matters. Single-GPU
+draft+verify still serialize, but the numbers above already include that - it is a win anyway.
