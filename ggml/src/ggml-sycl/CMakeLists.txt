@@ -192,16 +192,26 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
 endif()
 
+option(GGML_SYCL_AOT_FALLBACK "ggml: also embed generic SPIR-V when building AOT, so non-AOT devices still run (JIT)" ON)
+
 if (GGML_SYCL_DEVICE_ARCH)
-    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via spir64_gen)")
+    # spir64_gen alone emits device code ONLY for the listed -device values; any
+    # other Intel GPU fails to find a matching binary at runtime. Adding spir64
+    # embeds generic SPIR-V as a JIT fallback for unlisted devices.
+    if (GGML_SYCL_AOT_FALLBACK)
+        set(GGML_SYCL_AOT_TARGETS "spir64_gen,spir64")
+    else()
+        set(GGML_SYCL_AOT_TARGETS "spir64_gen")
+    endif()
+    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via ${GGML_SYCL_AOT_TARGETS})")
     target_compile_options(
         ggml-sycl PRIVATE
-        -fsycl-targets=spir64_gen
+        -fsycl-targets=${GGML_SYCL_AOT_TARGETS}
         "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
     )
     target_link_options(
         ggml-sycl PRIVATE
-        -fsycl-targets=spir64_gen
+        -fsycl-targets=${GGML_SYCL_AOT_TARGETS}
         "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
     )
 endif()
