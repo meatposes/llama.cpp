@@ -56,9 +56,10 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
 
 - `-c 131072` -> **8 GiB** of KV, on top of 6.7 GiB of weights. Fits a B70; `-fit on` is
   silently adjusting.
-- **B50 (16 GiB) is tight at `-c 131072`**: 6.7 + 8 + compute buffers ~= 15.7 GiB, marginal to
-  OOM. Fix it with **less context, not quantized KV** - q8_0 KV costs ~41% TG at depth on this
-  model (see section 3). F16 at `-c 65536` is 4 GiB and fits comfortably.
+- **B50 (16 GiB)**: arithmetic says `-c 131072` is tight (6.7 + 8 + buffers ~= 15.7 GiB), but
+  **measured 2026-07-16 it starts and serves** - see the B50 section below. Do not use quantized
+  KV to buy room: q8_0 costs ~41% TG at depth on this model (section 3). Prefer F16 KV at reduced
+  context if you need headroom (`-c 65536` = 4 GiB).
 
 ---
 
@@ -129,6 +130,45 @@ Cold start **2.95s** to model-loaded-and-listening, which also proves AOT is in 
 `libdnnl.so.3` must be copied into the image at `/app/` (it is on `LD_LIBRARY_PATH`).
 Do **not** work around a missing DNNL by setting `GGML_SYCL_DNN=OFF` - that silently disables
 the F16 path, which is the single largest prefill win.
+
+### B50 (bmg_g21) - validated on real hardware 2026-07-16
+
+Host `screamer` (10.0.0.200, `ssh -i ~/.ssh/id_nullraptor nullraptor@10.0.0.200`): Arc Pro B50 at
+84:00.0, 16304 MiB (16228 free), Xeon E5-2690 v4, Docker 29.1.3, Level Zero present, 1 Gb/s link.
+It has **no model and no /mnt/ignite**, so image (~9 GB) and GGUF (6.7 GB) must be shipped:
+
+    rsync -e "ssh -i ~/.ssh/id_nullraptor" <model.gguf> nullraptor@10.0.0.200:~/bonsai-models/
+    docker save llama-cpp-intel:prism-concatfix | gzip -1 \
+      | ssh -i ~/.ssh/id_nullraptor nullraptor@10.0.0.200 'gunzip | docker load'
+
+Model transfer ~71s at ~96 MB/s; image ~6.5 min (gzip -1 is the bottleneck, not the link).
+
+**The dual-arch AOT works on real B50 hardware.** Device reports Level Zero **20.1.0**, matching
+the `bmg-g21` IP version from `ocloc ids`. 9 bench runs completed in 58s wall *including* model
+load - JIT alone would cost ~90s, so `bmg_g21` AOT code is genuinely in use.
+
+| test | B50 | B70 | B50/B70 |
+| --- | ---: | ---: | ---: |
+| pp512 | 382.74 +/- 1.18 | 916.73 | 42% |
+| pp2048 | 362.01 +/- 0.97 | 876.51 | 41% |
+| tg128 | **20.39 +/- 0.11** | 41.94 | **49%** |
+
+**The TG ratio corroborates the roofline independently.** B50 spec bandwidth (~224 GB/s) over
+B70's measured ~460 GB/s is 0.487; measured TG ratio is 0.486. B50 does 20.39 x ~7.45 GB
+= ~152 GB/s, i.e. **~68% of its own ceiling - identical efficiency to B70**. Both cards are
+bandwidth-bound on weight reads, and the MMVQ kernel is equally (in)efficient on both. A win in
+MMVQ or an XMX Q2_0 GEMM should therefore transfer to B50 proportionally.
+
+**Context:** both `-c 131072` and `-c 65536` start and serve (health 200) with F16 KV. This
+**contradicts the earlier arithmetic** in section 1 that called `-c 131072` "marginal to OOM".
+Caveat: the server logs `common_init_result: fitting params to device memory ...`, so `-fit on`
+may be silently reducing the context - the effective `n_ctx` after fitting was not captured.
+**Open: confirm actual n_ctx at `-c 131072` on B50 before trusting full context there.**
+
+**Operational warning:** llama-server startup at large `-c` on B50 (KV alloc + `-fit` search +
+warmup + Q2_0 SoA reorder) pegs the GPU for a sustained period and makes the host sluggish. Run
+B50 containers with `--rm` and a foreground wait, never `docker run -d` with cleanup only at the
+end of a loop - an interrupted script orphans the container and it keeps grinding.
 
 ### Runtime knobs
 
