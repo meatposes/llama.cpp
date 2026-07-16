@@ -62,6 +62,7 @@ extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_disable_optimize;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_enable_flash_attention;
+extern int g_ggml_sycl_mmvq_max_batch;
 
 
 #if defined(__clang__) && __has_builtin(__builtin_expect)
@@ -165,7 +166,9 @@ typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
-#define MMVQ_MAX_BATCH_SIZE 32
+// Hard ceiling: the *_switch_ncols dispatchers only instantiate ncols_dst 1..32
+// and GGML_ABORT above that. g_ggml_sycl_mmvq_max_batch is clamped to this.
+#define MMVQ_MAX_BATCH_SIZE_LIMIT 32
 
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
