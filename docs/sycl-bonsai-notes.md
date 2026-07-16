@@ -442,10 +442,18 @@ VRAM: both `-b 512 -ub 512` and `-b 2048 -ub 2048` start fine at `-c 131072` on 
 **Deployed 2026-07-16** with `-b 2048 -ub 2048`. Real server log: an 819-token prompt evaluates at
 **714.55 t/s**.
 
-Caveat not yet measured: with `n_parallel = 4`, a larger ubatch is a coarser scheduling unit, so
-concurrent-user latency fairness may suffer even though throughput improves. If interactive
-latency regresses under concurrent load, drop back to `-ub 1024` (still +24% on pp2048) or the
-512 default. Worth a multi-user latency test.
+**Concurrency caveat MEASURED 2026-07-16 - no downside, `-ub 2048` is better here too.** 1
+big-prompt user (~1800 tok) + 3 small interactive users fired concurrently (`-np 4`):
+
+| metric | -ub 512 | -ub 2048 |
+| --- | ---: | ---: |
+| small-user worst latency | 4.56 s | **3.70 s** |
+| small-user TTFT | 3520 ms | **2511 ms** |
+| big-prompt total | 5.08 s | **4.19 s** |
+
+The coarser-scheduling worry was backwards: the big prompt prefills 35% faster at `-ub 2048`, so
+it clears the queue sooner and the small users waiting behind it are serviced sooner. That beats
+the finer interleaving of `-ub 512`. Keep `-ub 2048`.
 
 ## 4. Open questions
 
@@ -631,7 +639,7 @@ P1 - cheap, resolves open questions:
 4. ~~A/B `GGML_SYCL_MMVQ_MAX_BATCH` 8 vs 32.~~ DONE - 32 wins ~2x at batch 16-32. Next: find the
    real MMVQ/oneDNN crossover above 32 (needs `*_switch_ncols` instantiated past 32).
 5. ~~Sweep `-ub` / `-b`.~~ **DONE - `-ub 2048` is worth +35-39% prefill, deployed. See section 3c.**
-   Remaining: measure concurrent-user latency fairness at large ubatch with `n_parallel=4`.
+   Concurrent-user latency measured: `-ub 2048` is better under load too (section 3c). No open item.
 6. Get a B50 baseline on the dual-arch build.
 7. Establish the bandwidth ceiling. **This decides whether P2/P3 are worth doing at all.**
 
