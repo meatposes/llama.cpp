@@ -934,3 +934,39 @@ GEMM, common to int8 and fp16. Does not beat the 1.11 ms current-path bar.
 needs oneDNN-class GEMM engineering (register blocking, pipelining, no per-tile barriers) to reach -
 not a reasonable ask against oneDNN itself. Standalone dequant is bandwidth-bound at the ceiling
 (nothing left). Item 1 is fully closed.
+
+## 7. dspark -60% ROOT CAUSE FOUND (2026-07-16)
+
+**The dspark speculative-decode inversion (+34% CUDA vs -60% SYCL) is the Markov head running on
+CPU, not the recurrent-state PCIe copy originally hypothesized.**
+
+Chain of evidence:
+- The prism server DOES engage dspark capture correctly (`server-context.cpp:1195`, PR #63) - the
+  stale comment at `speculative.cpp:40` ("server path fails") predates prism's support. So dspark
+  runs correctly; the -60% is a real perf result.
+- The dspark Markov-head resample (`speculative.cpp:1350-1380`) has three compute paths: CUDA
+  (`dspark-markov.cu`), BLAS (cblas_sgemv), and a naive host loop. **There is NO SYCL/GPU path.**
+- The Markov weights are host-resident f32: `markov_head_a` [256 x 248320] BF16, expanded, and
+  `markov_head_b` [256 x 248320] Q4_1 -> ~254 MB f32. Per drafted token the resample does a
+  [248320 x 256].[256] GEMV over this 254 MB array + a full-vocab argmax. block_size=4.
+- **Measured** the naive host GEMV (`markov_cost.cpp`): **113 ms per draft round** (4 tokens,
+  254 MB, 9 GB/s single-thread). A target decode is ~24 ms/token. So each draft round adds ~113 ms
+  of CPU Markov work - ~5x one decode step - which dwarfs any acceptance benefit. This exactly
+  produces the -60%.
+
+(BLAS/MKL multithreaded would be faster, ~30-40 GB/s -> ~30 ms/round, still > a decode step and
+still net-negative. Only a GPU path fixes it. The deployed SYCL image was not built with
+LLAMA_DSPARK_MARKOV_BLAS, so it uses the ~113 ms naive path.)
+
+### Fix (tractable, unlike item 1)
+
+Implement a **SYCL Markov-head resample**: the GEMV [n_vocab x rank].[rank] + argmax on the GPU.
+Port `common/dspark-markov.cu` (the CUDA resample) to SYCL, or compute the GEMV via ggml on-device.
+On GPU the 127 MB BF16 GEMV at ~460 GB/s is ~0.3 ms/token -> ~1.2 ms/round instead of 113 ms.
+Unlike the XMX GEMM (item 1), this does NOT need to compete with a tuned library - it only needs to
+be fast enough to stop being the bottleneck (~1 ms), which a straightforward memory-bound GEMV
+kernel easily achieves. Expected result: dspark flips from -60% toward the CUDA-side +34%.
+
+Note the confidence head (`dspark.confidence_head`) and the drafter forward also run per round;
+those are small (5376x1) and on the normal SYCL path. The Markov GEMV is the sole 254 MB CPU
+outlier. Verify with a profile once the SYCL Markov path exists.
