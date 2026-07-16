@@ -401,13 +401,21 @@ gap is still in this kernel; everything else matches the AoS profile:
 | dequant | **0.494 s** | **0.267 s** |
 | DNNL gemm | 0.375 s | 0.368 s |
 
-Untested hypothesis: SoA splits the read into **two distant streams** - `qs` at offset 0 and the
-scales at offset `k/4` - whereas AoS keeps `d` and `qs` together in one 34-byte `block_q2_0`, so
-one stream and often one cache line. Worth trying: stage the scale through SLM per work-group, or
-have a work-group cover one block and load `d` once. If that is the cause, a layout change (e.g.
-interleaving scales per 32-byte run rather than a fully separate region) may be the real fix - but
-note the SoA layout exists to serve MMVQ, which is worth 2.7x on TG, so any layout change must
-keep MMVQ fast.
+**CONFIRMED 2026-07-16 - two-stream read is the cost.** Diagnostic: making the kernel read the
+scale from the near (qs) region instead of the far d region - wrong output, timing only - jumped
+pp512 from **769 to 850.50**, i.e. most of the remaining gap to the AoS 916. So `qs` at offset 0
+and scales at offset `k/4` being two distant memory streams is the dominant remaining cost; AoS
+keeps `d`+`qs` in one 34-byte `block_q2_0` struct (one stream).
+
+**Not a kernel-only fix, and it has a real tension.** The SoA layout is not incidental - it exists
+*because* it makes MMVQ fast: consecutive blocks' `qs` are contiguous, which is what the dp4a
+`reorder_vec_dot` wants, and MMVQ is worth **2.7x on TG**. AoS is better for dequant, SoA for
+MMVQ; a single layout cannot win both unless scales are duplicated or interleaved at some cost.
+Closing this fully means a layout change touching all four SoA sites (`reorder_qw_q2_0`,
+`dequantize_block_q2_0_reorder`, `reorder_vec_dot_q_sycl<Q2_0>`, `block_q_t<Q2_0>` offsets in
+quants.hpp) and must be validated to not regress the 2.7x TG. Scoped next-session work, not a
+tweak. Tried and rejected as kernel-only: staging scales is pointless (they are tiny and already
+broadcast-coalesced); the two-stream *latency*, not scale volume, is the issue.
 
 Note this also means the section 4 profile *understated* dequant: it profiled pp512 alone, i.e.
 the fast AoS kernel, at 23.7% of prefill. On the server path dequant is a larger share still.
