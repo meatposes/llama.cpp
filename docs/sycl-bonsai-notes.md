@@ -771,3 +771,41 @@ Things to check when an A-series card is available:
   CMake currently skips that flag whenever `GGML_SYCL_DEVICE_ARCH` is set
   (`ggml/src/ggml-sycl/CMakeLists.txt:167-171`). It has not bitten us on B70 because weights are
   allocated per-tensor rather than as one >4 GiB buffer, but confirm on a 16 GiB card.
+
+## 6. Item 1 - native Q2_0 XMX GEMM (IN PROGRESS 2026-07-16)
+
+Goal: replace dequant+oneDNN (which writes ~54 GB of F16 per ubatch) with an XMX int8 GEMM that
+consumes Q2_0 directly. Distinct from the failed dp4a MMQ: dp4a is not tensor-core; XMX int8 DPAS
+has ~2x fp16 throughput, so "dp4a can't beat oneDNN" does not apply.
+
+### Feasibility - DONE
+
+int8 `joint_matrix` (XMX DPAS) compiles AOT for bmg-g31 and runs correctly on B70. Probe in
+`docs/xmx-probe/`. Learned: B must be VNNI-packed (`[(k/4)*N*4 + n*4 + (k%4)]`, stride N*4);
+`layout::ext_intel_packed`; A/B must share element type; M8 N16 K32 tile works.
+
+### Design
+
+GEMM: `C[N_out, M_tok] = W[N_out, K] . X[K, M_tok]`, W=Q2_0, X=Q8_1 (activations already quantized
+to int8+scale for MMVQ).
+
+Key simplification vs MMVQ's bias trick: **expand Q2_0 to int8 `(raw - 1)` in {-1,0,1,2}**. int8
+XMX handles signed values, so `sum((raw_w-1)*raw_x)` is computed directly - no separate
+`-sum(raw_x)` bias term. Activations stay raw int8.
+
+Scaling: XMX accumulates int32. W scale `d_w` is per 128 K (per N-row); X scale `d_x` is per 32 K
+(per M-col). Accumulate int32 over a 32-K sub-block (both scales constant across it), then
+`C[m,n] += (d_x[m] * d_w[n]) * acc[m,n]`. The scale is an outer product over the tile - the main
+implementation cost, same problem CUDA `mmq.cuh` Q2_0 already solves (structural reference).
+
+### Plan (incremental, each gated on correctness vs CPU ref, none touching live dispatch)
+
+1. [DONE] int8 XMX probe.
+2. Standalone Q2_0-tile x Q8_1-tile -> float, one output tile, vs CPU reference.
+3. Full-matrix standalone (K-loop, tiling, SLM staging of expanded int8 + VNNI pack).
+4. Wire into `ggml_sycl_op_mul_mat_q` behind an env flag, off by default; A/B vs oneDNN on the
+   server prefill path. Only promote if it beats ~916 (the AoS ceiling) and stays correct.
+
+Risk: the per-32-K outer-product scaling may erode the XMX throughput advantage. Item 2's finding
+(prefill is dequant-traffic-bound, not compute-bound) is what makes this worth it - deleting the
+54 GB F16 write is the win even if the GEMM itself is only par with oneDNN.
