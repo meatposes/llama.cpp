@@ -43,3 +43,17 @@ trades MMVQ-contiguity vs dequant-locality.
 
 ## Running log
 (appended below as phases complete)
+
+## P0 RESULT (2026-07-17) - premise challenged, re-verifying
+
+Standalone layout sweep (`soa_layout.cpp`, ffn_up size): **dequant is FLAT at 0.713 ms across ALL
+S** (S=1 AoS through S=nblocks current-SoA). The layout does NOT change dequant kernel speed in
+isolation. MMVQ-read: S=1 (AoS) slow (149 GB/s, strided), S>=2 all fast (~420 GB/s).
+
+This contradicts the "two-stream read costs the dequant 16%" premise. It also matches the item-2
+review where standalone SoA dequant (0.382 ms) was already ~= AoS (0.411 ms). So the full-model
+916 (reorder-off) vs 769 (reorder-on) prefill gap is probably NOT the dequant layout.
+
+**Pivot: re-profile the reorder-ON prefill to find the REAL source of the gap before building any
+layout change.** If the dequant kernel is not the difference, a layout change won't help and this
+task becomes "find what actually causes the reorder-on prefill penalty."
