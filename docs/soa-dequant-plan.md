@@ -57,3 +57,18 @@ review where standalone SoA dequant (0.382 ms) was already ~= AoS (0.411 ms). So
 **Pivot: re-profile the reorder-ON prefill to find the REAL source of the gap before building any
 layout change.** If the dequant kernel is not the difference, a layout change won't help and this
 task becomes "find what actually causes the reorder-on prefill penalty."
+
+## P1 RESULT (2026-07-17) - NOT a layout problem, a WRITE-VECTORIZATION problem. FIX FOUND.
+
+Profiled the reorder-ON prefill: SoA dequant = 0.494 s vs AoS generic-template dequant = 0.268 s
+(same DNNL gemm ~0.37 s both). So the gap IS the dequant kernel, but not the layout - the AoS
+generic template uses vectorized (dfloat2) writes while my SoA kernel used 4 scalar half stores.
+
+Standalone kernel comparison on the SAME SoA layout (`dq_kernel.cpp`):
+  K1 (4 scalar writes, current) : 0.801 ms, 223 GB/s
+  K2 (2x half2 write)           : **0.374 ms, 477 GB/s  (2.1x)**
+  K3 (2 bytes, 4x half2)        : 0.715 ms (worse - occupancy)
+
+**Fix: write the 4 dequant outputs as two `sycl::vec<dst_t,2>` instead of 4 scalars.** No layout
+change, no MMVQ touch, no TG risk. Applied to `dequantize_block_q2_0_reorder`. Expected: SoA dequant
+0.494 -> ~0.27 s, closing most of the 769 -> 916 server-prefill gap (~+16%).

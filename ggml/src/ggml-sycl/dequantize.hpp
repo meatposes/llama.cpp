@@ -772,12 +772,14 @@ static void dequantize_block_q2_0_reorder(const void * __restrict__ vx, dst_t * 
     const sycl::half * s_ptr = (const sycl::half *) ((const uint8_t *) vx + nbytes) + bi / (QK2_0 / 4);
     const float        d     = float(*s_ptr);
 
-    dst_t * y = yy + bi * 4;
-
-    y[0] = d * ((b & 0x03) - 1);
-    y[1] = d * (((b >> 2) & 0x03) - 1);
-    y[2] = d * (((b >> 4) & 0x03) - 1);
-    y[3] = d * (((b >> 6) & 0x03) - 1);
+    // Write the 4 outputs as two 2-element vectors. The vectorized store roughly doubles write
+    // throughput vs four scalar stores (measured ~223 -> ~477 GB/s on B70), which is the whole gap
+    // between this SoA dequant and the AoS generic-template dequant. bi*4 elements is always
+    // 2*sizeof(dst_t)-aligned.
+    using vec2 = sycl::vec<dst_t, 2>;
+    vec2 * y2 = reinterpret_cast<vec2 *>(yy + bi * 4);
+    y2[0] = vec2(static_cast<dst_t>(d * ((b & 0x03) - 1)), static_cast<dst_t>(d * (((b >> 2) & 0x03) - 1)));
+    y2[1] = vec2(static_cast<dst_t>(d * (((b >> 4) & 0x03) - 1)), static_cast<dst_t>(d * (((b >> 6) & 0x03) - 1)));
 }
 
 template<typename dst_t>
