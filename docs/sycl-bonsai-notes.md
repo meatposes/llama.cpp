@@ -173,7 +173,8 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
    net-negative at 131072 (full-context staging) and UNUSABLE on the B50. (Sections 9 and 10; B50
    detail also in section 2)
 4. **XMX Q2_0 GEMM: NO-GO** (int8 and fp16 both ~10x slower than oneDNN). (Section 8)
-5. Kernel wins deployed: concat +8%, SoA dequant +16% (server prefill). KV quant rejected (-41%).
+5. Kernel wins: concat +8%; SoA dequant coalesce +16%, then **half2-write +29% more (768->994 server
+   prefill, tg unchanged)** - 2026-07-17. KV quant rejected (-41%).
 
 Committed code on `sycl/bonsai-q2_0-perf`:
 

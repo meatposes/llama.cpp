@@ -72,3 +72,16 @@ Standalone kernel comparison on the SAME SoA layout (`dq_kernel.cpp`):
 **Fix: write the 4 dequant outputs as two `sycl::vec<dst_t,2>` instead of 4 scalars.** No layout
 change, no MMVQ touch, no TG risk. Applied to `dequantize_block_q2_0_reorder`. Expected: SoA dequant
 0.494 -> ~0.27 s, closing most of the 769 -> 916 server-prefill gap (~+16%).
+
+## P2 RESULT (2026-07-17) - VALIDATED, big win, deploying
+
+Full-model A/B (JIT build, fixed kernel):
+- **server-path pp512: 768 -> 994 (+29%)** - beats even the old AoS-path 916 (the half2 SoA dequant
+  is faster than the AoS generic template).
+- **tg128: 42.22 (unchanged)** - zero TG regression, as expected (dequant is the prefill path).
+- Correctness: coherent generation including through the post-reorder prefill path ("Paris", a
+  50x-repeated long prompt answers "fox", "1..10"). Standalone K2 also matched the CPU reference.
+
+The task turned out NOT to be the layout change I planned - it was a one-line write-vectorization
+in the existing SoA dequant kernel. Lower risk, bigger win. Layout change abandoned (unneeded).
+Next: AOT rebuild + image + deploy (keeping :meat4-dspark as rollback).
