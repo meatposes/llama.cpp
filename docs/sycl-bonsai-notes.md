@@ -166,12 +166,13 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
 ### Headline findings (read these first; details in the sections below)
 
 1. **SYCL graph is a 2.8x TG regression at `-c 131072`** (15 vs 42 t/s) - deploy graph OFF. The old
-   "graph neutral" claim was wrong. Biggest deployed-perf lever. (Section 8)
+   "graph neutral" claim was wrong. Biggest deployed-perf lever. (Section 10)
 2. **`-ub 2048`** is +35-39% prefill, no downside. (Section 3c) Deployed.
 3. **dspark was -60% because its Markov head ran on CPU**; one-line fix (allow Q4_1 head type) puts
    it on GPU. Then dspark is a real win on structured workloads (code +62% at small ctx) but
-   net-negative at 131072 (full-context staging) and UNUSABLE on the B50. (Section 7 + B50 section)
-4. **XMX Q2_0 GEMM: NO-GO** (int8 and fp16 both ~10x slower than oneDNN). (Section 6)
+   net-negative at 131072 (full-context staging) and UNUSABLE on the B50. (Sections 9 and 10; B50
+   detail also in section 2)
+4. **XMX Q2_0 GEMM: NO-GO** (int8 and fp16 both ~10x slower than oneDNN). (Section 8)
 5. Kernel wins deployed: concat +8%, SoA dequant +16% (server prefill). KV quant rejected (-41%).
 
 Committed code on `sycl/bonsai-q2_0-perf`:
@@ -892,7 +893,7 @@ Things to check when an A-series card is available:
   (`ggml/src/ggml-sycl/CMakeLists.txt:167-171`). It has not bitten us on B70 because weights are
   allocated per-tensor rather than as one >4 GiB buffer, but confirm on a 16 GiB card.
 
-## 6. Item 1 - native Q2_0 XMX GEMM (IN PROGRESS 2026-07-16)
+## 8. Native Q2_0 XMX GEMM - investigated, NO-GO (2026-07-16) [backlog "item 1"]
 
 Goal: replace dequant+oneDNN (which writes ~54 GB of F16 per ubatch) with an XMX int8 GEMM that
 consumes Q2_0 directly. Distinct from the failed dp4a MMQ: dp4a is not tensor-core; XMX int8 DPAS
@@ -1055,7 +1056,7 @@ needs oneDNN-class GEMM engineering (register blocking, pipelining, no per-tile 
 not a reasonable ask against oneDNN itself. Standalone dequant is bandwidth-bound at the ceiling
 (nothing left). Item 1 is fully closed.
 
-## 7. dspark -60% ROOT CAUSE FOUND (2026-07-16)
+## 9. dspark -60% ROOT CAUSE + FIX (2026-07-16)
 
 **The dspark speculative-decode inversion (+34% CUDA vs -60% SYCL) is the Markov head running on
 CPU, not the recurrent-state PCIe copy originally hypothesized.**
@@ -1157,7 +1158,7 @@ in the deployed B70 config. On the B50 it is UNUSABLE at any useful context (<0.
 dspark section). **So: dspark is a win only at small context (~8k) on the B70; keep it OFF at 128k
 and OFF on the B50.** The deployed B70 image (`:meat4-dspark`) carries the fix but runs no dspark.
 
-## 8. BIGGEST DEPLOYED WIN: SYCL graph is HARMFUL at -c 131072 (2026-07-16)
+## 10. BIGGEST DEPLOYED WIN: SYCL graph is HARMFUL at -c 131072 (2026-07-16)
 
 **The deployed server ran `GGML_SYCL_DISABLE_GRAPH=0` (graph ON) the whole time - and at
 `-c 131072` that is a 2.8x TG REGRESSION, not "neutral" as previously believed.**
