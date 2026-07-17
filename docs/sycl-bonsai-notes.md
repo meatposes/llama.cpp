@@ -53,9 +53,9 @@ Q4_1 markov fix). It is the one to deploy.
       -p 8001:8080 -v /mnt/ignite/LLM/huggingface/gguf/Ternary-Bonsai-27B-gguf:/models \
       llama-cpp-bonsai:meat4-dspark \
       -m /models/Ternary-Bonsai-27B-Q2_0.gguf -ngl 99 -dev SYCL0 \
-      -c 131072 -b 2048 -ub 2048 --reasoning off --port 8080
+      -c 131072 -b 4096 -ub 4096 --reasoning off --port 8080
 
-TG ~42 t/s, PP ~860 t/s (prefill-only). **CRITICAL: do NOT add `GGML_SYCL_DISABLE_GRAPH=0`** - graph
+TG ~42 t/s, PP ~860 t/s (prefill-only). `-ub 4096` is the prefill optimum (+~1.3% vs 2048, plateaus past). **CRITICAL: do NOT add `GGML_SYCL_DISABLE_GRAPH=0`** - graph
 ON halves TG to ~15 at this context. Omitting it = graph off = correct.
 
 ## 0.5 Deploy - B50 (16 GB, screamer), no dspark
@@ -99,7 +99,7 @@ OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v1/models`). Spe
 | Rule | Why |
 | --- | --- |
 | Graph OFF (no `DISABLE_GRAPH=0`) | graph ON = 2.8x TG loss at 128k |
-| `-ub 2048` | +35% prefill, no downside |
+| `-ub 4096` (>=2048) | +35% prefill; 4096 is the optimum (+1.3% vs 2048, plateaus) |
 | Keep F16 KV (no `-ctk/-ctv q8_0`) | q8_0 KV = -41% TG at depth |
 | Bundle `libdnnl.so.3`; keep `GGML_SYCL_DNN=ON` | else F16 prefill path dies silently |
 | dspark: B70 + small ctx only | 128k net-negative, B50 unusable |
@@ -167,7 +167,7 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
 
 1. **SYCL graph is a 2.8x TG regression at `-c 131072`** (15 vs 42 t/s) - deploy graph OFF. The old
    "graph neutral" claim was wrong. Biggest deployed-perf lever. (Section 10)
-2. **`-ub 2048`** is +35-39% prefill, no downside. (Section 3c) Deployed.
+2. **`-ub 4096`** is +35-39% prefill, no downside (4096 = optimum, plateaus past). (Section 3c) Deployed.
 3. **dspark was -60% because its Markov head ran on CPU**; one-line fix (allow Q4_1 head type) puts
    it on GPU. Then dspark is a real win on structured workloads (code +62% at small ctx) but
    net-negative at 131072 (full-context staging) and UNUSABLE on the B50. (Sections 9 and 10; B50
@@ -582,7 +582,16 @@ big-prompt user (~1800 tok) + 3 small interactive users fired concurrently (`-np
 
 The coarser-scheduling worry was backwards: the big prompt prefills 35% faster at `-ub 2048`, so
 it clears the queue sooner and the small users waiting behind it are serviced sooner. That beats
-the finer interleaving of `-ub 512`. Keep `-ub 2048`.
+the finer interleaving of `-ub 512`. Keep a large `-ub`.
+
+**Follow-up 2026-07-17: `-ub 4096` is the true optimum; `convert_unary` is not worth chasing.**
+- ub sweep (prefill-only): pp4096 = 971 (ub2048) -> **982.7 (ub4096)** -> 982 (ub8192); pp8192 = 810
+  -> **821 (ub4096)** -> 819. ub=4096 is +~1.3% over 2048 and everything past 4096 plateaus.
+  **Deployed `-b 4096 -ub 4096`** (fits at `-c 131072`, 32 GB free at load, TG unchanged 42.8).
+- `convert_unary` (~5.8% of PP, VTune profile) is the guarded F32->F16 activation conversion feeding
+  DNNL (`ggml-sycl.cpp:2478`, `if (src1->type != GGML_TYPE_F16)`). NOT redundant - activations
+  arrive F32 from the graph, DNNL wants F16. Removing it needs an F16 activation graph (F16
+  throughout), invasive and risks precision across every op. Skip - not a cheap win.
 
 ## 4. Open questions
 
