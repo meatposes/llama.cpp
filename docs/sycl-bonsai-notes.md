@@ -56,16 +56,28 @@ Per token, per full-attention layer: K = `4 kv_heads * 256 dim * 2 B` = 2048 B, 
 
 - `-c 131072` -> **8 GiB** of KV, on top of 6.7 GiB of weights. Fits a B70; `-fit on` is
   silently adjusting.
-- **B50 (16 GiB)**: arithmetic says `-c 131072` is tight (6.7 + 8 + buffers ~= 15.7 GiB), but
-  **measured 2026-07-16 it starts and serves** - see the B50 section below. Do not use quantized
-  KV to buy room: q8_0 costs ~41% TG at depth on this model (section 3). Prefer F16 KV at reduced
-  context if you need headroom (`-c 65536` = 4 GiB).
+- **B50 (16 GiB)**: no-dspark serves fine; the DEPLOYED B50 config is `-c 65536 -np 1` graph off
+  (20.8 t/s). `-c 131072` no-dspark technically fits but is tight; **dspark on B50 is UNUSABLE at
+  any useful context** (OOMs at `-np 4`, and even loaded is <0.07 t/s - see "B50 dspark findings").
+  Do not use quantized KV to buy room: q8_0 costs ~41% TG at depth (section 3). Prefer F16 KV at
+  reduced context.
 
 ---
 
 ## 2. Current state
 
-Committed on `sycl/bonsai-q2_0-perf`:
+### Headline findings (read these first; details in the sections below)
+
+1. **SYCL graph is a 2.8x TG regression at `-c 131072`** (15 vs 42 t/s) - deploy graph OFF. The old
+   "graph neutral" claim was wrong. Biggest deployed-perf lever. (Section 8)
+2. **`-ub 2048`** is +35-39% prefill, no downside. (Section 3c) Deployed.
+3. **dspark was -60% because its Markov head ran on CPU**; one-line fix (allow Q4_1 head type) puts
+   it on GPU. Then dspark is a real win on structured workloads (code +62% at small ctx) but
+   net-negative at 131072 (full-context staging) and UNUSABLE on the B50. (Section 7 + B50 section)
+4. **XMX Q2_0 GEMM: NO-GO** (int8 and fp16 both ~10x slower than oneDNN). (Section 6)
+5. Kernel wins deployed: concat +8%, SoA dequant +16% (server prefill). KV quant rejected (-41%).
+
+Committed code on `sycl/bonsai-q2_0-perf`:
 
 | Commit | What |
 | --- | --- |
@@ -78,6 +90,10 @@ Committed on `sycl/bonsai-q2_0-perf`:
 | `sycl: normalize GGML_SYCL_DEVICE_ARCH for ocloc` | `_`->`-`; unblocks multi-device AOT |
 | `sycl: coalesce writes in the Q2_0 SoA dequant kernel` | **+15% server prefill** (662 -> 763) |
 | `sycl: one qs byte per work-item in Q2_0 SoA dequant` | +0.7% more (-> 769) |
+| `dspark: allow Q4_1/Q5_1 markov heads on the GPU resample path` | **dspark -60% fix** (markov off CPU) |
+
+Config-only wins (no code): graph OFF (2.8x TG @131072), `-ub 2048` (+35% prefill). Both in the
+deployed run command, neither in a commit.
 
 ### Build
 
@@ -111,9 +127,16 @@ in the build log.
     docker build -f Dockerfile.mmq-test -t llama-cpp-intel:prism-concatfix .
     docker tag llama-cpp-intel:prism-concatfix llama-cpp-bonsai:meat2
 
-**Currently deployed: `llama-cpp-bonsai:meat3` (`f0f0e7a9ab9d`)**, 2026-07-16, includes the concat
-and SoA dequant fixes. Cold start 2.93s. Rollback images retained: `:meat2` (`06c007b37469`,
-concat fix only) and `:meat` (`6c00cd3a7690`, neither).
+**CURRENTLY DEPLOYED (updated 2026-07-17): `llama-cpp-bonsai:meat4-dspark`, GRAPH OFF, no dspark.**
+B70 main box, `-c 131072 -b 2048 -ub 2048`, no `GGML_SYCL_DISABLE_GRAPH=0`. `:meat4-dspark` = the
+`:meat3` binaries plus the dspark Q4_1 markov GPU fix (`src/llama-context.cpp`); non-dspark decode
+is identical to `:meat3`. **Deploy graph OFF - graph ON is a 2.8x TG regression at 131072 (section
+8), the single biggest deployed-perf finding.** Real deployed TG ~42 t/s (was ~15 with graph on).
+Rollback images retained: `:meat3`/`:meat2`/`:meat` (older, all graph-agnostic binaries).
+Screamer B50 runs `:meat4-dspark` no-dspark at `-c 65536` (20.8 t/s) - see the B50 dspark section.
+
+Historical A/B below (the meat2/meat3 prefill numbers) predates the graph and dspark findings; kept
+for the record. The deployed-perf story that matters now is: graph OFF + `-ub 2048`.
 
 Server-path A/B on the real AOT images (`-ub 8,512`, i.e. reorder fired - see section 3b):
 
@@ -998,7 +1021,10 @@ Note the confidence head (`dspark.confidence_head`) and the drafter forward also
 those are small (5376x1) and on the normal SYCL path. The Markov GEMV is the sole 254 MB CPU
 outlier. Verify with a profile once the SYCL Markov path exists.
 
-### dspark fix RESULT: markov bottleneck eliminated, dspark now neutral (not yet positive)
+### dspark fix RESULT: markov bottleneck eliminated; dspark is a WIN on structured workloads
+
+(Header corrected: an intermediate reading called it "neutral" - that was the worst-case prose
+prompt only. The prompt-type sweep below settled it: net-positive on realistic workloads.)
 
 Rebuilt llama-server with the Q4_1 fix and tested end-to-end (drafter Q4_1, block_size=4, capture on
 5 layers):
@@ -1023,10 +1049,16 @@ harmless on prose. No host fallback in any run. (n_max is NOT tunable - it must 
 block_size=4; `--spec-draft-n-max 2` fails at load. So there is no n_max sweep, only prompt type.)
 The earlier single chat=2.8 t/s reading was a one-off glitch; warm it is 40.8/42.1.
 
-**Verdict: the markov fix turns dspark from -60% (broken) into a net win on realistic workloads.
-Enable it in the bonsai container.** The old "0.85 acceptance" claim was likely an even-more-
-structured workload; the real range is 0.30-0.69, still a clear win where it matters. Single-GPU
-draft+verify still serialize, but the numbers above already include that - it is a win anyway.
+**Verdict: the markov fix turns dspark from -60% (broken) into a net win on realistic workloads
+AT SMALL CONTEXT.** The old "0.85 acceptance" claim was likely an even-more-structured workload;
+real range 0.30-0.69, a clear win where it matters.
+
+**REFINED by later findings (do not "just enable it" everywhere):** the sweep above was at
+`-c 8192`. dspark's drafter does full-context staging (`n_batch -> ctx+4`) every round, so its cost
+scales with context. At the production `-c 131072` it is NET-NEGATIVE (~64 ms/token) and NOT enabled
+in the deployed B70 config. On the B50 it is UNUSABLE at any useful context (<0.07 t/s; see the B50
+dspark section). **So: dspark is a win only at small context (~8k) on the B70; keep it OFF at 128k
+and OFF on the B50.** The deployed B70 image (`:meat4-dspark`) carries the fix but runs no dspark.
 
 ## 8. BIGGEST DEPLOYED WIN: SYCL graph is HARMFUL at -c 131072 (2026-07-16)
 
