@@ -85,3 +85,14 @@ Full-model A/B (JIT build, fixed kernel):
 The task turned out NOT to be the layout change I planned - it was a one-line write-vectorization
 in the existing SoA dequant kernel. Lower risk, bigger win. Layout change abandoned (unneeded).
 Next: AOT rebuild + image + deploy (keeping :meat4-dspark as rollback).
+
+## P3 DEPLOYED (2026-07-17) - :meat5-dqfix live, benchy captured
+
+- AOT A/B confirmed: :meat4-dspark 767 -> :meat5-dqfix 989 server-path pp512 (+29%). TG unchanged.
+- Deployed `llama-cpp-bonsai:meat5-dqfix`, graph off, `-b 4096 -ub 4096`, `-c 131072`, cold start ~3s.
+  Correct ("fox" via post-reorder prefill). Rollback: :meat4-dspark, :meat3.
+- Shallow-context llama-benchy (depth 0, end-to-end API): pp512 650, pp2048 930, tg128 ~40 t/s.
+  (Raw llama-bench server-path pp512 = 989; benchy is lower - includes HTTP/tokenize/e2e overhead.)
+
+TASK COMPLETE: the +16% target was exceeded (+29%) via a write-vectorization fix, not the planned
+layout change. Layout change was unnecessary. Next: re-profile to find the next prefill lever.

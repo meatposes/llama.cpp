@@ -226,7 +226,9 @@ in the build log.
     docker build -f Dockerfile.mmq-test -t llama-cpp-intel:prism-concatfix .
     docker tag llama-cpp-intel:prism-concatfix llama-cpp-bonsai:meat2
 
-**CURRENTLY DEPLOYED (updated 2026-07-17): `llama-cpp-bonsai:meat4-dspark`, GRAPH OFF, no dspark.**
+**CURRENTLY DEPLOYED (updated 2026-07-17): `llama-cpp-bonsai:meat5-dqfix`, GRAPH OFF, no dspark, on `ai-network`.**
+= :meat4-dspark + the half2 SoA-dequant fix (server pp512 767->989, +29%; TG unchanged). Rollback: :meat4-dspark.
+
 B70 main box, `-c 131072 -b 2048 -ub 2048`, no `GGML_SYCL_DISABLE_GRAPH=0`. `:meat4-dspark` = the
 `:meat3` binaries plus the dspark Q4_1 markov GPU fix (`src/llama-context.cpp`); non-dspark decode
 is identical to `:meat3`. **Deploy graph OFF - graph ON is a 2.8x TG regression at 131072 (section
