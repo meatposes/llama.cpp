@@ -10,6 +10,103 @@ Model: `prism-ml/Ternary-Bonsai-27B-gguf`, `Ternary-Bonsai-27B-Q2_0.gguf`.
 
 ---
 
+# QUICK REFERENCE - how to run (everything below section 0 is investigation history)
+
+## 0.1 What this fork adds
+
+SYCL (Intel Arc) support for Ternary-Bonsai-27B (Q2_0), which upstream/prism did not have on Intel:
+
+- **Q2_0 on the SYCL backend**: dequant, get_rows, MMVQ, and the SoA weight reorder that makes
+  decode fast. Bonsai now runs on Arc B70/B50 without falling back to CPU.
+- **Dual-arch AOT build** (`bmg_g31` + `bmg_g21`) with a SPIR-V JIT fallback, so one image runs both
+  cards (and JITs on anything else).
+- **Perf fixes** (all in-tree): non-contiguous concat work-group size (+8% prefill, generic backend
+  fix), coalesced Q2_0 SoA dequant (+16% server prefill), runtime-tunable MMVQ batch cap.
+- **dspark speculative decoding fix**: the drafter's Q4_1 Markov head was silently running on CPU
+  (254 MB GEMV, ~113 ms/round = -60% TG). One-line fix (`src/llama-context.cpp`, allow Q4_1/Q5_1
+  head types) runs it on the GPU. dspark is now a real win on structured workloads at small context.
+- **Config discovery, not code**: SYCL graph ON is a **2.8x TG regression** at 128k context, and
+  `-ub 2048` is +35% prefill. Both are just run-command flags (see below).
+
+## 0.2 Build (AOT, ~40-120 min for two device targets)
+
+    source /opt/intel/oneapi/setvars.sh --force
+    cmake -S . -B build -DGGML_SYCL_DNN=ON -DGGML_SYCL_F16=ON \
+          -DGGML_SYCL_DEVICE_ARCH="bmg_g31,bmg_g21"
+    cmake --build build --config Release --target ggml-sycl llama-server llama-bench -j$(nproc)
+
+`libdnnl.so.3` MUST be present at runtime (bundle it into the image at `/app/`). Do NOT set
+`GGML_SYCL_DNN=OFF` - it silently kills the F16 path (the largest prefill win).
+
+## 0.3 Image
+
+    # .dockerignore: comment out `build*/` first, then restore after
+    docker build -f Dockerfile.mmq-test -t llama-cpp-bonsai:meat4-dspark .
+
+Current image `llama-cpp-bonsai:meat4-dspark` = all the above (Q2_0 + fixes + dual-arch AOT + dspark
+Q4_1 markov fix). It is the one to deploy.
+
+## 0.4 Deploy - B70 (32 GB, main box), the good config
+
+    docker run -d --name llama-cpp-bonsai --restart unless-stopped --device=/dev/dri \
+      -e ONEAPI_DEVICE_SELECTOR=level_zero:1 -e GGML_SYCL_VISIBLE_DEVICES=0 -e LLAMA_ARG_HOST=0.0.0.0 \
+      -p 8001:8080 -v /mnt/ignite/LLM/huggingface/gguf/Ternary-Bonsai-27B-gguf:/models \
+      llama-cpp-bonsai:meat4-dspark \
+      -m /models/Ternary-Bonsai-27B-Q2_0.gguf -ngl 99 -dev SYCL0 \
+      -c 131072 -b 2048 -ub 2048 --reasoning off --port 8080
+
+TG ~42 t/s, PP ~860 t/s (prefill-only). **CRITICAL: do NOT add `GGML_SYCL_DISABLE_GRAPH=0`** - graph
+ON halves TG to ~15 at this context. Omitting it = graph off = correct.
+
+## 0.5 Deploy - B50 (16 GB, screamer), no dspark
+
+    docker run -d --name bonsai --restart unless-stopped --device=/dev/dri \
+      -e ONEAPI_DEVICE_SELECTOR=level_zero:0 -e GGML_SYCL_VISIBLE_DEVICES=0 -e LLAMA_ARG_HOST=0.0.0.0 \
+      -p 8001:8080 -v ~/bonsai-models:/models \
+      llama-cpp-bonsai:meat4-dspark \
+      -m /models/Ternary-Bonsai-27B-Q2_0.gguf -ngl 99 -dev SYCL0 \
+      -c 65536 -np 1 -b 2048 -ub 2048 --no-warmup --reasoning off --port 8080
+
+TG ~20.8 t/s (half the B70). Load takes several minutes on the slow host (`--no-warmup`, healthcheck
+`start_period >= 300s`). B50 needs `-c 65536` (16 GB won't hold 128k comfortably) and `-np 1`.
+
+## 0.6 dspark (speculative decoding) - when to use, when NOT
+
+Add to the run command to enable:
+
+    --spec-type draft-dspark --spec-draft-n-max 4 \
+    --spec-draft-model /models/Ternary-Bonsai-27B-dspark-Q4_1.gguf
+
+- **Use it only on the B70 at SMALL context (`-c 8192`).** There it wins on structured content:
+  code +62%, factual +17%, prose neutral (no penalty). `n_max` must equal the drafter's block_size
+  (4); other values fail at load.
+- **Do NOT enable at 128k** - the drafter stages the full context every round (`n_batch -> ctx+4`),
+  making it net-negative (~64 ms/token) at large context.
+- **Do NOT enable on the B50** - it OOMs at `-np 4`, and even loaded is <0.07 t/s (unusable).
+- Requires the drafter GGUF (`Ternary-Bonsai-27B-dspark-Q4_1.gguf`).
+
+## 0.7 Test it
+
+    curl -s http://<host>:8001/v1/chat/completions -H 'Content-Type: application/json' \
+      -d '{"messages":[{"role":"user","content":"Explain how rainbows form."}],"max_tokens":200}' \
+      | jq -r '.choices[0].message.content'
+
+OpenAI-compatible (`/v1/chat/completions`, `/v1/completions`, `/v1/models`). Speed shows in
+`.timings.predicted_per_second`.
+
+## 0.8 Gotchas summary
+
+| Rule | Why |
+| --- | --- |
+| Graph OFF (no `DISABLE_GRAPH=0`) | graph ON = 2.8x TG loss at 128k |
+| `-ub 2048` | +35% prefill, no downside |
+| Keep F16 KV (no `-ctk/-ctv q8_0`) | q8_0 KV = -41% TG at depth |
+| Bundle `libdnnl.so.3`; keep `GGML_SYCL_DNN=ON` | else F16 prefill path dies silently |
+| dspark: B70 + small ctx only | 128k net-negative, B50 unusable |
+| One GPU `DEVICE_LOST` -> STOP, don't retry same card | retries wedge it into a reboot |
+
+---
+
 ## 1. The model - read this before optimizing anything
 
 Getting this wrong cost the first round of work its direction, so it goes first.
