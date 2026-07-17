@@ -93,6 +93,28 @@ static void k_get_rows_float(
     dst_row[i00] = src0_row[i00];
 }
 
+// float4-vectorized copy for the F32->F32 gather (grid over ne00/4). ~1.9x the scalar copy on B70.
+// Only launched when src0/dst are float, ne00 % 4 == 0, and rows are 16-byte aligned; otherwise the
+// scalar kernel above is used (all other types/shapes unchanged).
+static void k_get_rows_float_vec4(
+            const float * src0, const int32_t * src1, float * dst,
+            int64_t ne00_4, int64_t ne12, size_t s1, size_t s2, size_t s3,
+            size_t nb01, size_t nb02, size_t nb03, size_t s10, size_t s11, size_t s12,
+            const sycl::nd_item<3> &item_ct1) {
+    const int j = item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    const int i10 = item_ct1.get_local_range(1) * item_ct1.get_group(1) + item_ct1.get_local_id(1);
+    const int gid0 = item_ct1.get_group(0) * item_ct1.get_local_range(0) + item_ct1.get_local_id(0);
+    const int i11 = gid0 / ne12;
+    const int i12 = gid0 % ne12;
+    if (j >= ne00_4) {
+        return;
+    }
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const sycl::float4 * src0_row = (const sycl::float4 *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    sycl::float4 * dst_row = (sycl::float4 *)(dst + i10*s1 + i11*s2 + i12*s3);
+    dst_row[j] = src0_row[j];
+}
+
 template <int qk, int qr, dequantize_kernel_t dq>
 static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
                           ggml_tensor *dst, const void *src0_dd,
@@ -156,6 +178,24 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 
+        // float4 fast path: F32->F32 gather with ne00 % 4 == 0 and 16-byte-aligned rows.
+        const bool can_vec4 = std::is_same<src0_t, float>::value && std::is_same<dst_t, float>::value &&
+                              (ne00 % 4 == 0) && (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+                              (s1 % 4 == 0) && (s2 % 4 == 0) && (s3 % 4 == 0);
+        if constexpr (std::is_same<src0_t, float>::value && std::is_same<dst_t, float>::value) {
+          if (can_vec4) {
+            const int64_t ne00_4 = ne00 / 4;
+            const int bnx = (ne00_4 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
+            const sycl::range<3> bn(ne11 * ne12, ne10, bnx);
+            stream->parallel_for(sycl::nd_range<3>(bn * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_get_rows_float_vec4((const float *)src0_dd, src1_dd, (float *)dst_dd, ne00_4,
+                                          ne12, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
+                });
+            GGML_UNUSED(dst); GGML_UNUSED(ctx);
+            return;
+          }
+        }
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item_ct1) {
