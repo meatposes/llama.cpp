@@ -96,3 +96,12 @@ Next: AOT rebuild + image + deploy (keeping :meat4-dspark as rollback).
 
 TASK COMPLETE: the +16% target was exceeded (+29%) via a write-vectorization fix, not the planned
 layout change. Layout change was unnecessary. Next: re-profile to find the next prefill lever.
+
+## Bonus (2026-07-17): get_rows float4 - committed, not deployed
+After the dequant fix, re-profiled: DNNL gemm (0.377) and delta-net (0.237) are now the top prefill
+items; dequant dropped 0.494 -> 0.190. Found get_rows (0.133) is float4-vectorizable: standalone
+1.88x (827->1553 GB/s). Implemented with a strict F32/aligned guard + scalar fallback; all F32
+GET_ROWS tests pass. Full model: pp512 989->995 (+0.7%), tg128 42.2->43.4. Committed for the next
+rebuild; :meat5-dqfix stays deployed (has the +29% dequant win). Remaining prefill levers are all
+higher-effort: DNNL gemm (oneDNN, 68% peak), delta-net chunked prefill (greenfield ~10%), XMX FA
+(~5%). No more cheap wins after these two.
