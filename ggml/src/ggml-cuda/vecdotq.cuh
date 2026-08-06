@@ -675,6 +675,33 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
+static __device__ __forceinline__ int4 unpack_q1_0_bytes(const uint16_t q) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t q32 = q;
+    const int      n0  = __byte_perm(0x11100100, 0x11100100, q32 >> 0);
+    const int      n1  = __byte_perm(0x11100100, 0x11100100, q32 >> 2);
+    const int      s0  = __byte_perm(0x01FF, 0x01FF, n0 >> 0);
+    const int      s1  = __byte_perm(0x01FF, 0x01FF, n1 >> 0);
+    const int      s2  = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+    const int      s3  = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+
+    return make_int4(__byte_perm(s0, s1, 0x5410), __byte_perm(s0, s1, 0x7632), __byte_perm(s2, s3, 0x5410),
+                     __byte_perm(s2, s3, 0x7632));
+#else
+    int values[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int bits4 = (q >> (4 * j)) & 0x0F;
+        const int b0    = (bits4 & 0x01) ? 1 : -1;
+        const int b1    = (bits4 & 0x02) ? 1 : -1;
+        const int b2    = (bits4 & 0x04) ? 1 : -1;
+        const int b3    = (bits4 & 0x08) ? 1 : -1;
+        values[j]       = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+    }
+    return make_int4(values[0], values[1], values[2], values[3]);
+#endif
+}
+
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -684,44 +711,30 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
-    const float d1 = bq1_0->d;
+    const float     d1 = bq1_0->d;
+    const uint16_t * qs = (const uint16_t *) bq1_0->qs + iqs * 2;
 
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
-    // Load 32 bits (4 bytes) for this chunk from Q1_0
-    const int offset = iqs * 4;
-    const int v = bq1_0->qs[offset + 0] | (bq1_0->qs[offset + 1] << 8) |
-                  (bq1_0->qs[offset + 2] << 16) | (bq1_0->qs[offset + 3] << 24);
-
-    // Unpack 32 bits into 32 raw UNSIGNED {0,1} lanes -- no per-element sign
-    // materialization. Symbol = 2*bit - 1, so sum(symbol*act) = 2*sum(bit*act)
-    // - sum(act); that affine correction is applied once at the end instead
-    // (matches the deferred-correction pattern vec_dot_q4_0_q8_1_impl uses).
-    int vi_bytes[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int shift = j * 4;
-        const int bits4 = (v >> shift) & 0x0F;
-        const int b0    = (bits4 >> 0) & 1;
-        const int b1    = (bits4 >> 1) & 1;
-        const int b2    = (bits4 >> 2) & 1;
-        const int b3    = (bits4 >> 3) & 1;
-        vi_bytes[j]     = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-    }
-
-    // Compute dot product for this 32-element chunk
     int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    for (int j = 0; j < 2; ++j) {
+        const int4 v = unpack_q1_0_bytes(qs[j]);
+
+        const int u0 = get_int_b4(bq8_1_chunk->qs, j * 4 + 0);
+        const int u1 = get_int_b4(bq8_1_chunk->qs, j * 4 + 1);
+        const int u2 = get_int_b4(bq8_1_chunk->qs, j * 4 + 2);
+        const int u3 = get_int_b4(bq8_1_chunk->qs, j * 4 + 3);
+
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+        sumi = ggml_cuda_dp4a(v.z, u2, sumi);
+        sumi = ggml_cuda_dp4a(v.w, u3, sumi);
     }
 
-    // ds.x = d8 (per-block activation scale), ds.y = sum(act) in real units
-    // (see quantize_q8_1: y[ib].ds = make_half2(d, sum)).
-    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
-    return d1 * (2.0f * sumi * ds8f.x - ds8f.y);
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d1 * d8 * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
@@ -733,58 +746,35 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Q8_1: 32 elements per block with individual scales
     // iqs selects which of the 4 chunks of 32 elements to process (0-3)
 
-    const float d2 = bq2_0->d;
+    const float     d2 = bq2_0->d;
+    // each 32-element chunk occupies 8 bytes of qs (4 int16), regardless of group size
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
 
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
-    // Load 64 bits (8 bytes) for this chunk from Q2_0: bytes [8*iqs, 8*iqs+8)
-    const int offset = iqs * 8;
-    const int v0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
-                   (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
-    const int v1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
-                   (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
-
-    // Unpack 32 2-bit codes into 8 int32s of raw UNSIGNED codes {0,1,2,(3)} --
-    // no per-element "-1" offset. Symbol s = code - 1, so sum(s*act) =
-    // sum(code*act) - sum(act); that correction is applied once at the end
-    // instead (matches the deferred-correction pattern vec_dot_q4_0_q8_1_impl
-    // uses -- code 3 is unreachable from the reference quantizer, so this
-    // covers the only codes {0,1,2} that ever actually occur).
-    int vi_bytes[8];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int shift = j * 8;
-        const int codes = (v0 >> shift) & 0xFF;
-        const int c0    = (codes >> 0) & 0x3;
-        const int c1    = (codes >> 2) & 0x3;
-        const int c2    = (codes >> 4) & 0x3;
-        const int c3    = (codes >> 6) & 0x3;
-        vi_bytes[j]     = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int shift = j * 8;
-        const int codes = (v1 >> shift) & 0xFF;
-        const int c0    = (codes >> 0) & 0x3;
-        const int c1    = (codes >> 2) & 0x3;
-        const int c2    = (codes >> 4) & 0x3;
-        const int c3    = (codes >> 6) & 0x3;
-        vi_bytes[4 + j] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
-    }
-
-    // Compute dot product for this 32-element chunk
     int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
+        const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
+
+        // the permute source 0x020100FF holds bytes {-1,0,1,2}, so a 2-bit code
+        // indexes straight to its symbol (s = code - 1) with no arithmetic
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        // unshuffle values
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+        sumi = ggml_cuda_dp4a(v, qy, sumi);
     }
 
-    // ds.x = d8 (per-block activation scale), ds.y = sum(act) in real units
-    // (see quantize_q8_1: y[ib].ds = make_half2(d, sum)).
-    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
-    return d2 * (sumi * ds8f.x - ds8f.y);
+    // symbols are already signed, so no deferred sum(act) correction is needed
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
